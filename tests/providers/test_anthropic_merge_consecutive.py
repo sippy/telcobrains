@@ -1,4 +1,5 @@
 from nanobot.providers.anthropic_provider import AnthropicProvider
+from nanobot.utils.helpers import estimate_prompt_tokens, estimate_prompt_tokens_chain
 
 
 class TestMergeConsecutive:
@@ -109,11 +110,7 @@ class TestMergeConsecutive:
         assert result[1]["content"] == "hi"
         assert result[2]["content"] == "ok"
 
-    def test_leading_assistant_with_tool_use_left_alone(self):
-        """Don't prepend a synthetic opener before an assistant carrying
-        ``tool_use``; doing so would orphan the paired ``tool_result`` that
-        follows.  The caller will see the original 400 rather than a
-        harder-to-diagnose tool-pair mismatch."""
+    def test_leading_tool_use_gets_opener_without_splitting_pair(self):
         msgs = [
             {
                 "role": "assistant",
@@ -129,4 +126,23 @@ class TestMergeConsecutive:
             },
         ]
         result = AnthropicProvider._merge_consecutive(msgs)
-        assert [m["role"] for m in result] == ["assistant", "user"]
+        assert result[0] == {"role": "user", "content": "(conversation continued)"}
+        assert result[1:] == msgs
+
+
+def test_request_budget_counts_the_anthropic_replay_opener(monkeypatch):
+    monkeypatch.setattr("nanobot.utils.helpers._get_token_encoding", lambda: None)
+    provider = object.__new__(AnthropicProvider)
+    raw = [
+        {"role": "system", "content": "Previous checkpoint."},
+        {"role": "assistant", "tool_calls": [{
+            "id": "call-1", "type": "function", "function": {"name": "search", "arguments": "{}"},
+        }]},
+        {"role": "tool", "tool_call_id": "call-1", "content": "Found it."},
+    ]
+    _, wire_messages = provider._convert_messages(raw)
+    opener = wire_messages[0]
+    assert opener["role"] == "user"
+    cost, _ = estimate_prompt_tokens_chain(provider, None, raw)
+    assert cost == estimate_prompt_tokens([raw[0], opener, *raw[1:]])
+    assert cost > estimate_prompt_tokens(raw)

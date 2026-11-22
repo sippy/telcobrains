@@ -713,7 +713,7 @@ class ContextGovernor:
         delta_messages: list[dict[str, Any]],
         tool_definitions: list[dict[str, Any]] | None,
         *,
-        replay_starts_at_user: bool = False,
+        session_compaction: bool = False,
         next_turn_input_reserve_tokens: int = 0,
     ) -> int | None:
         """Choose the oldest raw prefix to compact, protecting a verbatim tail.
@@ -729,6 +729,13 @@ class ContextGovernor:
         summary). Any newer cut compacts a larger prefix, so when the most
         protective cut fails the compactor budget no useful cut exists. If
         either budget check fails, the caller chooses its usual fallback.
+
+        A legal boundary does not split a tool call from its result. In-turn
+        compaction may cut at any legal boundary. Session compaction cuts at
+        user turns or, with a positive verbatim-tail floor, also at assistant
+        messages (including mid-turn tool calls). The committed checkpoint
+        preserves that assistant-leading tail on replay. With the floor
+        disabled, session compaction keeps the legacy user-boundary sizing.
 
         ``next_turn_input_reserve_tokens`` keeps that many foreground input
         tokens free for the next turn's fresh input; session compaction (no
@@ -788,7 +795,7 @@ class ContextGovernor:
         if prefix_capacity <= 0:
             return None
 
-        floor = config.min_verbatim_tail_tokens if replay_starts_at_user else 0
+        floor = config.min_verbatim_tail_tokens if session_compaction else 0
         # A positive session floor counts only replayable history and must
         # still leave a nonempty history prefix to summarize.
         first_cut = max(2, len(wrapper) + 1) if floor > 0 else 2
@@ -806,8 +813,11 @@ class ContextGovernor:
             tail_cost += costs[index]
             if tail_cost > tail_budget:
                 break
-            # Durable replay aligns the head of persisted history to a user turn.
-            if tail_cost >= floor and legal[index] and (not replay_starts_at_user or raw[index].get("role") == "user"):
+            if tail_cost >= floor and legal[index] and (
+                not session_compaction
+                or raw[index].get("role") == "user"
+                or (floor > 0 and raw[index].get("role") == "assistant")
+            ):
                 cut = index
                 cut_tail_cost = tail_cost
         if cut is None or total_cost - cut_tail_cost > prefix_capacity:

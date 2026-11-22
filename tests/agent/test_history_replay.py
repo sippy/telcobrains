@@ -10,6 +10,7 @@ from nanobot.bus.events import InboundMessage
 from nanobot.bus.queue import MessageBus
 from nanobot.providers.base import LLMResponse
 from nanobot.session.manager import Session
+from nanobot.utils.helpers import find_legal_message_start
 
 
 def _make_loop(tmp_path: Path, context_window_tokens: int = 200_000) -> AgentLoop:
@@ -44,6 +45,81 @@ def _tool_round(call_id: str) -> list[dict]:
         },
         {"role": "tool", "tool_call_id": call_id, "name": "x", "content": "ok"},
     ]
+
+
+def _checkpointed_assistant_tail() -> Session:
+    """A session whose committed checkpoint left an assistant-leading tail."""
+    session = Session(key="test:mid-turn")
+    session.messages = [
+        {"role": "user", "content": "old question"},
+        {"role": "assistant", "content": "old answer"},
+        {"role": "user", "content": "big first instruction"},
+        *_tool_round("c1"),
+        {"role": "assistant", "content": "final answer"},
+        {"role": "user", "content": "next question"},
+        {"role": "assistant", "content": "next answer"},
+    ]
+    session.commit_summary_checkpoint("summary", insert_at=3)
+    return session
+
+
+def test_checkpointed_assistant_tail_replays_verbatim() -> None:
+    """A mid-turn cut's assistant-leading tail stays whole, including bounded reads."""
+    session = _checkpointed_assistant_tail()
+
+    history = session.get_history(include_runtime_context=False)
+    assert [message.get("content") for message in history] == [
+        None, "ok", "final answer", "next question", "next answer",
+    ]
+    assert history[0]["tool_calls"][0]["id"] == "c1"
+    assert find_legal_message_start(history) == 0
+    # A bounded estimate that still fits the whole tail must not drop the
+    # retained leading assistant tool round to realign on the next user turn.
+    bounded = session.get_text_history(max_tokens=200, include_runtime_context=False)
+    assert [message.get("content") for message in bounded] == [
+        None, "ok", "final answer", "next question", "next answer",
+    ]
+
+
+def test_verbatim_assistant_tail_bounded_estimate_keeps_retained_lead() -> None:
+    session = _checkpointed_assistant_tail()
+
+    # The budget trims the leading tool round, but the retained "final answer"
+    # (whose question was archived) must survive instead of being dropped to
+    # realign the head on the next user turn.
+    bounded = session.get_text_history(max_tokens=60, include_runtime_context=False)
+    assert [message.get("content") for message in bounded] == [
+        "final answer", "next question", "next answer",
+    ]
+    assert find_legal_message_start(bounded) == 0
+
+
+def test_legacy_head_still_realigns_to_first_user_turn() -> None:
+    """A head without a checkpoint keeps the existing mid-turn realignment."""
+    session = Session(key="test:legacy")
+    session.messages = [
+        {"role": "assistant", "content": "orphaned reply"},
+        {"role": "user", "content": "first question"},
+        {"role": "assistant", "content": "first answer"},
+    ]
+
+    assert [m.get("content") for m in session.get_history(include_runtime_context=False)] == [
+        "first question", "first answer",
+    ]
+    assert [m.get("content") for m in session.get_text_history(max_tokens=60, include_runtime_context=False)] == [
+        "first question", "first answer",
+    ]
+
+
+def test_message_index_maps_verbatim_assistant_tail_positions() -> None:
+    session = _checkpointed_assistant_tail()
+
+    # Replayable positions after the checkpoint: 0=assistant(c1), 1=result,
+    # 2=final answer, 3=next question, 4=next answer.
+    assert session.message_index_at_history_position(0) == 4
+    assert session.message_index_at_history_position(1) == 5
+    assert session.message_index_at_history_position(4) == 8
+    assert session.message_index_at_history_position(5) is None
 
 
 def test_default_history_has_no_message_count_limit() -> None:

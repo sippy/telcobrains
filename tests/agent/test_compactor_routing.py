@@ -616,15 +616,16 @@ def _seed_floor_session(loop, key: str) -> list[dict]:
 async def test_session_compaction_floor_skips_when_tail_below_floor(
     tmp_path, trigger, monkeypatch,
 ) -> None:
-    # Deterministic per-message cost: the protected tail (four recent messages)
-    # is 400 tokens, so a 401-token floor cannot be met by any legal cut.
+    # Deterministic per-message cost: the largest legal tail (five messages at
+    # the "old answer" assistant boundary) is 500 tokens, so a 501-token floor
+    # cannot be met by any legal user or assistant cut.
     monkeypatch.setattr(
         "nanobot.agent.context_governance.estimate_message_tokens",
         lambda message: 100,
     )
     foreground, loop = _make_loop(
         tmp_path, context_window_tokens=12_000, fg_max_tokens=100,
-        session_ttl_minutes=1, min_verbatim_tail_tokens=401,
+        session_ttl_minutes=1, min_verbatim_tail_tokens=501,
     )
     compactor = loop.compactor_runtime().provider
     key = "cli:floor-skip"
@@ -674,12 +675,12 @@ async def test_session_compaction_floor_skips_when_tail_below_floor(
         await loop.aclose()
 
 
-@pytest.mark.parametrize("floor", [399, 400])
+@pytest.mark.parametrize("floor", [499, 500])
 async def test_session_compaction_floor_proceeds_when_tail_meets_floor(
     tmp_path, monkeypatch, floor,
 ) -> None:
-    # Equality is allowed for the 400-token retained tail when the overall
-    # history is above the floor.
+    # The oldest legal cut now leaves a 500-token assistant-leading tail.
+    # Equality is allowed when the overall history is above the floor.
     monkeypatch.setattr(
         "nanobot.agent.context_governance.estimate_message_tokens",
         lambda message: 100,
@@ -691,7 +692,7 @@ async def test_session_compaction_floor_proceeds_when_tail_meets_floor(
     compactor = loop.compactor_runtime().provider
     key = "cli:floor-ok"
     full_history = _seed_floor_session(loop, key)
-    expected_tail = full_history[2:]
+    expected_tail = full_history[1:]
 
     await loop._process_message(
         InboundMessage(channel="cli", sender_id="user", chat_id="floor-ok", content="/compact"),
@@ -702,7 +703,7 @@ async def test_session_compaction_floor_proceeds_when_tail_meets_floor(
     compactor.chat_stream_with_retry.assert_awaited_once()
     loop.sessions.invalidate(key)
     reloaded = loop.sessions.get_or_create(key)
-    assert reloaded.last_archived == 3
+    assert reloaded.last_archived == 1
     assert reloaded.metadata["_last_summary"]["text"] == "Checkpoint."
     assert reloaded.get_history() == expected_tail
     await loop.aclose()

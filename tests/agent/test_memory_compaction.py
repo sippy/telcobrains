@@ -10,7 +10,11 @@ fit the history consolidator's actual input budget. When no cut satisfies
 both budgets, the previous full-prefix compaction behavior is preserved.
 """
 
+from datetime import datetime, timedelta
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
+
+import pytest
 
 from agent.runner_helpers import make_run_spec
 from nanobot.agent.context import TranscriptInput
@@ -25,8 +29,11 @@ from nanobot.agent.memory import Consolidator
 from nanobot.agent.runner import AgentRunner
 from nanobot.bus.queue import MessageBus
 from nanobot.config.schema import AgentDefaults
+from nanobot.providers.anthropic_provider import AnthropicProvider
 from nanobot.providers.base import GenerationSettings, LLMProvider, LLMResponse
 from nanobot.providers.conversation_state import ProviderConversationStateController
+from nanobot.sdk.clients import RuntimeClient
+from nanobot.session.history_visibility import is_hidden_history_message
 from nanobot.session.manager import Session
 from nanobot.session.summary import SUMMARY_CONTINUATION_TEXT, CompactorInputBudget
 from nanobot.utils.llm_runtime import LLMRuntime
@@ -377,7 +384,7 @@ def _session_cut(monkeypatch, *, reserve: int, budget: CompactorInputBudget) -> 
     raw = [*wrapper, *_SESSION_HISTORY]
     return ContextGovernor().select_prefix_cut(
         config, raw, len(raw), budget, wrapper, None, [], None,
-        replay_starts_at_user=True,
+        session_compaction=True,
         next_turn_input_reserve_tokens=reserve,
     )
 
@@ -405,6 +412,107 @@ def test_session_cut_reserve_does_not_reduce_compactor_capacity(monkeypatch):
     )
     assert _session_cut(monkeypatch, reserve=0, budget=budget) == 4
     assert _session_cut(monkeypatch, reserve=200, budget=budget) == 4
+
+
+def _session_cut_with_floor(
+    monkeypatch,
+    history: list[dict],
+    *,
+    floor: int,
+    budget: CompactorInputBudget,
+    reserve: int = 0,
+    window: int = 10_000,
+    heavy: str = "old",
+) -> int | None:
+    """Call ``select_prefix_cut`` like session compaction, with a verbatim floor."""
+    _cost_model(monkeypatch, heavy=heavy)
+    config = ContextGovernanceConfig(
+        provider=MagicMock(spec=LLMProvider),
+        model="test-model",
+        tools=MagicMock(get_definitions=MagicMock(return_value=[])),
+        workspace=None,
+        session_key="cut-test",
+        max_tool_result_chars=_MAX_TOOL_RESULT_CHARS,
+        context_window_tokens=window,
+        max_tokens=100,
+        min_verbatim_tail_tokens=floor,
+    )
+    wrapper = [{"role": "system", "content": "wrapper"}]
+    raw = [*wrapper, *history]
+    return ContextGovernor().select_prefix_cut(
+        config, raw, len(raw), budget, wrapper, None, [], None,
+        session_compaction=True,
+        next_turn_input_reserve_tokens=reserve,
+    )
+
+
+_TOOL_TURN_HISTORY = [
+    {"role": "user", "content": "HEAVY q1"},
+    _assistant_tool_call("c1"),
+    {"role": "tool", "tool_call_id": "c1", "name": "exec", "content": "HEAVY r1"},
+    _assistant_tool_call("c2"),
+    {"role": "tool", "tool_call_id": "c2", "name": "exec", "content": "HEAVY r2"},
+    {"role": "assistant", "content": "done"},
+    {"role": "user", "content": "q2"},
+    {"role": "assistant", "content": "a2"},
+]
+
+
+def test_session_cut_uses_tool_pair_safe_assistant_boundary_for_tool_heavy_turn(monkeypatch):
+    """A long tool-heavy first turn that a user-only cut cannot keep.
+
+    The only eligible user boundary (q2) keeps 20 tokens, below the 900-token
+    floor, so a user-only cut would skip the compaction (the first user turn
+    cannot start a nonempty archive prefix). The assistant reply that opens
+    the tool-heavy turn keeps 1050 tokens with every tool pair whole, so the
+    cut lands there and the compaction proceeds.
+    """
+    budget = CompactorInputBudget(
+        input_budget=5000, fixed_overhead_tokens=100, max_summary_tokens=200,
+    )
+    cut = _session_cut_with_floor(monkeypatch, _TOOL_TURN_HISTORY, floor=900, budget=budget, heavy="HEAVY")
+
+    raw = [{"role": "system", "content": "wrapper"}, *_TOOL_TURN_HISTORY]
+    assert cut == 2
+    assert raw[cut]["role"] == "assistant"
+    assert raw[cut]["tool_calls"][0]["id"] == "c1"
+    tail = raw[cut:]
+    declared = {
+        call["id"]
+        for message in tail
+        if message.get("role") == "assistant"
+        for call in message.get("tool_calls") or []
+    }
+    assert {m["tool_call_id"] for m in tail if m.get("role") == "tool"} == declared
+
+
+def test_session_mid_turn_cut_must_fit_both_budgets_and_reserve(monkeypatch):
+    # The only tail meeting the 900-token floor costs 1050 tokens; its prefix
+    # costs 510. Reserving one more input token, or taking one away from the
+    # compactor, independently makes the cut impossible.
+    def cut(reserve: int, compactor_input: int) -> int | None:
+        return _session_cut_with_floor(
+            monkeypatch, _TOOL_TURN_HISTORY, floor=900, reserve=reserve,
+            window=2500, heavy="HEAVY",
+            budget=CompactorInputBudget(compactor_input, 100, 200),
+        )
+
+    assert cut(106, 610) == 2
+    assert cut(107, 610) is None
+    assert cut(106, 609) is None
+
+
+def test_session_cut_floor_disabled_keeps_legacy_user_boundary_sizing(monkeypatch):
+    budget = CompactorInputBudget(
+        input_budget=5000, fixed_overhead_tokens=100, max_summary_tokens=200,
+    )
+    cut = _session_cut_with_floor(monkeypatch, _TOOL_TURN_HISTORY, floor=0, budget=budget, heavy="HEAVY")
+
+    raw = [{"role": "system", "content": "wrapper"}, *_TOOL_TURN_HISTORY]
+    # Legacy sizing: the oldest user boundary (q2) wins and the mid-turn
+    # assistant boundary stays out of play without a floor.
+    assert cut == 7
+    assert raw[cut]["role"] == "user"
 
 
 def test_foreground_cut_ignores_next_turn_reserve(monkeypatch):
@@ -769,3 +877,196 @@ async def test_prefix_cut_persists_summary_at_mapped_boundary_and_replays_tail(
     )] == [
         "q2", old2, "q3", "", "result ok", "a3", "continue the task", "done",
     ]
+
+
+@pytest.mark.parametrize("trigger", ["scheduled_idle", "sdk"])
+async def test_mid_turn_cut_persists_checkpoint_before_assistant_tail(
+    tmp_path, monkeypatch, trigger,
+) -> None:
+    """Session compaction cuts at the tool-pair-safe assistant boundary.
+
+    The tool-heavy first turn is long enough that no user boundary keeps the
+    configured verbatim-tail floor; the assistant reply opening the turn does.
+    The committed checkpoint lands before that assistant, and a fresh reload
+    replays the assistant-leading tail verbatim with every tool pair intact —
+    the next foreground turn sends it as-is after the summary.
+    """
+    provider = MagicMock(aclose=AsyncMock())
+    provider.get_default_model.return_value = "test-model"
+    provider.generation = GenerationSettings(max_tokens=100)
+    provider.can_resume_conversation_state.return_value = False
+    provider.chat_stream_with_retry = AsyncMock(side_effect=[
+        LLMResponse(content="Mid-turn checkpoint.", tool_calls=[]),
+        LLMResponse(content="done", tool_calls=[]),
+    ])
+
+    def estimate(messages, _tools, _model):
+        total = 0
+        for message in messages:
+            content = str(message.get("content") or "")
+            if "HEAVY" in content:
+                total += 2000
+            elif content.strip():
+                total += 10
+        return max(total, 10), "test-counter"
+
+    provider.estimate_prompt_tokens = estimate
+    loop = AgentLoop(
+        bus=MessageBus(),
+        provider=provider,
+        workspace=tmp_path,
+        model="test-model",
+        context_window_tokens=20_000,
+        session_ttl_minutes=1,
+    )
+    loop.tools.get_definitions = MagicMock(return_value=[])
+    loop.consolidator._SAFETY_BUFFER = 0
+    loop.schedule_background = lambda coro: coro.close()  # type: ignore[method-assign]
+    loop.compactor_min_verbatim_tail_tokens = 4000
+
+    def message_cost(message):
+        return 2000 if "HEAVY" in str(message.get("content") or "") else 10
+
+    monkeypatch.setattr(
+        "nanobot.agent.context_governance.estimate_message_tokens", message_cost,
+    )
+    monkeypatch.setattr("nanobot.session.manager.estimate_message_tokens", message_cost)
+
+    session = loop.sessions.get_or_create("cli:mid")
+    session.messages = [
+        {"role": "user", "content": "HEAVY first instruction"},
+        _assistant_tool_call("t1"),
+        {"role": "tool", "tool_call_id": "t1", "name": "exec", "content": "HEAVY result one"},
+        _assistant_tool_call("t2"),
+        {"role": "tool", "tool_call_id": "t2", "name": "exec", "content": "HEAVY result two"},
+        {"role": "assistant", "content": "done"},
+        {"role": "user", "content": "q2"},
+        {"role": "assistant", "content": "a2"},
+    ]
+    session.updated_at = datetime.now() - timedelta(minutes=10)
+    loop.sessions.save(session)
+    if trigger == "sdk":
+        assert await RuntimeClient(loop).compact_idle_session(session.key) == "Mid-turn checkpoint."
+    else:
+        scheduled = []
+        await loop.auto_compact.check_expired(scheduled.append, loop.compaction_runtime_for_session)
+        assert len(scheduled) == 1
+        await scheduled.pop()
+
+    # A fresh load: the checkpoint maps to the persisted boundary just before
+    # the assistant reply, and the tool-heavy tail survives verbatim, including
+    # its leading assistant tool call and every result.
+    loop.sessions.invalidate("cli:mid")
+    reloaded = loop.sessions.get_or_create("cli:mid")
+    assert reloaded.metadata["_last_summary"]["text"] == "Mid-turn checkpoint."
+    assert reloaded.last_archived == 1
+    assert is_hidden_history_message(reloaded.messages[1])
+    assert reloaded.messages[1]["content"] == SUMMARY_CONTINUATION_TEXT
+    replayed = reloaded.get_history(include_runtime_context=False)
+    assert [message.get("content") for message in replayed] == [
+        "", "HEAVY result one", "", "HEAVY result two", "done", "q2", "a2",
+    ]
+    assert replayed[0]["role"] == "assistant"
+    assert replayed[0]["tool_calls"][0]["id"] == "t1"
+    declared = {
+        call["id"]
+        for message in replayed
+        if message.get("role") == "assistant"
+        for call in message.get("tool_calls") or []
+    }
+    assert {m["tool_call_id"] for m in replayed if m.get("role") == "tool"} == declared
+
+    # The next foreground turn replays the assistant-leading tail right after
+    # the summary, without dropping its leading message.
+    result = await loop.process_direct("continue the task", session_key="cli:mid")
+    assert result.content == "done"
+    request = loop.provider.chat_stream_with_retry.call_args.kwargs["messages"]
+    assert "Mid-turn checkpoint." in request[0]["content"]
+    assert request[1]["role"] == "assistant"
+    assert request[1]["tool_calls"][0]["id"] == "t1"
+    assert request[2]["role"] == "tool"
+    assert request[2]["tool_call_id"] == "t1"
+    assert request[2]["content"] == "HEAVY result one"
+    await loop.aclose()
+
+
+async def test_anthropic_replays_and_recompacts_checkpointed_tool_tail(tmp_path, monkeypatch):
+    monkeypatch.setattr("nanobot.utils.helpers._get_token_encoding", lambda: None)
+    provider = AnthropicProvider(api_key="sk-test")
+    provider.generation = GenerationSettings(max_tokens=100)
+    loop = AgentLoop(
+        bus=MessageBus(), provider=provider, workspace=tmp_path,
+        model=provider.get_default_model(), context_window_tokens=48_000,
+        compactor_min_verbatim_tail_tokens=1_000,
+    )
+    tools = [tool for tool in loop.tools.get_definitions() if tool["function"]["name"] == "exec"]
+    monkeypatch.setattr(loop.tools, "get_definitions", lambda: tools)
+    key = "cli:anthropic-mid-turn"
+    session = loop.sessions.get_or_create(key)
+    session.messages = [
+        {"role": "user", "content": "Investigate the processing logs."},
+        *[message for i in range(3) for message in (
+            _assistant_tool_call(f"batch-{i}"),
+            {"role": "tool", "name": "exec", "tool_call_id": f"batch-{i}",
+             "content": f"shard={i} status=processed\n" * 300},
+        )],
+        {"role": "assistant", "content": "All shards processed."},
+    ]
+    # Reopen a genuinely committed checkpoint from an earlier compaction.
+    session.commit_summary_checkpoint("Previous investigation.", insert_at=1)
+    loop.sessions.save(session)
+    loop.sessions.invalidate(key)
+    requests = []
+
+    def open_stream(**kwargs):
+        requests.append(kwargs)
+        text = "Foreground answer." if len(requests) == 1 else "Second checkpoint."
+        stream = MagicMock()
+        stream.__anext__.side_effect = StopAsyncIteration
+        stream.get_final_message = AsyncMock(return_value=SimpleNamespace(
+            content=[SimpleNamespace(type="text", text=text)], stop_reason="end_turn",
+            usage=SimpleNamespace(input_tokens=10, output_tokens=5),
+        ))
+        cm = MagicMock()
+        cm.__aenter__.return_value = stream
+        return cm
+
+    monkeypatch.setattr(provider._client.messages, "stream", open_stream)
+    monkeypatch.setattr(provider._client.messages, "create", AsyncMock(side_effect=AssertionError("Unexpected SDK call")))
+    try:
+        session = loop.sessions.get_or_create(key)
+        original_tail = session.get_history()
+        reply = await loop.process_direct("What did the logs show?", session_key=key)
+        assert reply.content == "Foreground answer."
+        assert loop.sessions.get_or_create(key).get_history()[:len(original_tail)] == original_tail
+
+        # With no override, Anthropic also summarizes the oldest retained tool
+        # round. Set the reserve to force one whole round out of the replay tail.
+        loop.compactor_next_turn_input_reserve_tokens = 25_000
+        preview = await loop.process_direct("/compact --dry-run", session_key=key)
+        assert "summary generated by the compactor (discarded)" in preview.content
+        assert await RuntimeClient(loop).compact_idle_session(key) == "Second checkpoint."
+        assert len(requests) == 3
+        assert requests[1] == requests[2]
+        assert "Previous investigation." in requests[2]["system"][0]["text"]
+        for request, expected_ids in zip(requests[:2], [{"batch-0", "batch-1", "batch-2"}, {"batch-0"}], strict=True):
+            messages = request["messages"]  # System instructions are a separate Anthropic field.
+            assert messages[0]["role"] == "user"
+            pairs = set()
+            for index, message in enumerate(messages):
+                content = message["content"]
+                if not isinstance(content, list):
+                    continue
+                calls = {block["id"] for block in content if block["type"] == "tool_use"}
+                if calls:
+                    assert message["role"] == "assistant"
+                    assert messages[index + 1]["role"] == "user"
+                    results = [block["tool_use_id"] for block in messages[index + 1]["content"]
+                               if block["type"] == "tool_result"]
+                    assert sorted(results) == sorted(calls)
+                    pairs.update(calls)
+            assert pairs == expected_ids
+        loop.sessions.invalidate(key)
+        assert loop.sessions.get_or_create(key).get_history()[:len(original_tail) - 2] == original_tail[2:]
+    finally:
+        await loop.aclose()

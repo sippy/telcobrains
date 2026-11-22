@@ -21,6 +21,7 @@ from nanobot.providers.base import (
     tool_arguments_object_for_replay,
 )
 from nanobot.providers.images import prepare_message_images
+from nanobot.utils.helpers import estimate_prompt_tokens
 
 if TYPE_CHECKING:
     from nanobot.providers.registry import ProviderSpec
@@ -433,6 +434,32 @@ class AnthropicProvider(LLMProvider):
         return False
 
     @staticmethod
+    def _with_user_opener(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        # Works on both raw and converted messages: system instructions are
+        # out of band, and raw tool results become user turns on the wire.
+        for i, message in enumerate(messages):
+            role = message.get("role")
+            if role in {"user", "tool"}:
+                break
+            if role == "assistant":
+                if any(m.get("role") in {"user", "tool"} for m in messages):
+                    # Prepending (not re-roling) keeps tool_use adjacent to
+                    # the following tool_result turn in checkpointed replays.
+                    opener = {"role": "user", "content": "(conversation continued)"}
+                    return [*messages[:i], opener, *messages[i:]]
+                break  # Assistant-only prefill is handled by rule 2.
+        return messages
+
+    def estimate_prompt_tokens(
+        self, messages: list[dict[str, Any]], tools: list[dict[str, Any]] | None, _model: str | None,
+    ) -> tuple[int, str]:
+        """Charge the wire opener in request checks without converting the transcript twice."""
+        projected = self._with_user_opener(messages)
+        if projected is messages:
+            return 0, "none"  # Use the caller's normal estimator chain.
+        return estimate_prompt_tokens(projected, tools), "anthropic replay estimate"
+
+    @staticmethod
     def _merge_consecutive(msgs: list[dict[str, Any]]) -> list[dict[str, Any]]:
         """Normalize a message sequence for Anthropic's ``/messages`` endpoint.
 
@@ -446,11 +473,8 @@ class AnthropicProvider(LLMProvider):
 
         Rules 2 and 3 mirror ``LLMProvider._enforce_role_alternation`` in
         ``base.py``, which applies the equivalent invariants to OpenAI-compat
-        providers.  The only Anthropic-specific wrinkle: ``tool_use`` blocks
-        live inside ``content`` (not a separate ``tool_calls`` field) and are
-        invalid inside ``user`` turns, so the recovery paths below must skip
-        any message carrying them rather than silently producing a malformed
-        request.
+        providers. Anthropic ``tool_use`` blocks live inside ``content``
+        and are invalid inside ``user`` turns, so never re-role a tool call.
         """
         merged: list[dict[str, Any]] = []
         for msg in msgs:
@@ -483,20 +507,8 @@ class AnthropicProvider(LLMProvider):
         ):
             merged.append({"role": "user", "content": last_popped.get("content")})
 
-        # Rule 3: prepend a synthetic opener if the first surviving turn is an
-        # assistant (e.g. upstream history truncation dropped the original
-        # user request).  ``tool_use``-carrying assistants are left alone —
-        # that message will still fail validation, but injecting an opener
-        # before it would orphan the tool_use/tool_result pair that follows,
-        # turning a recoverable 400 into a harder-to-diagnose one.
-        if (
-            merged
-            and merged[0].get("role") == "assistant"
-            and not AnthropicProvider._has_tool_use(merged[0])
-        ):
-            merged.insert(0, {"role": "user", "content": "(conversation continued)"})
-
-        return merged
+        # Rule 3: history truncation or compaction can remove the original user turn.
+        return AnthropicProvider._with_user_opener(merged)
 
 
     @staticmethod

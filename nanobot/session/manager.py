@@ -213,33 +213,37 @@ class Session:
         if position < 0:
             return None
         replayable = self.messages[self.last_archived:]
-        start = 0
-        for i, message in enumerate(replayable):
-            if message.get("role") == "user":
-                start = i
-                if i > 0 and replayable[i - 1].get("_channel_delivery"):
-                    start = i - 1
-                break
-        start += find_legal_message_start(replayable[start:])
+        start = self._replay_start_index(replayable)
         seen = 0
         for offset, message in enumerate(replayable[start:], start=start):
-            if message.get("_command") or is_summary_checkpoint(message):
-                continue
-            content = message.get("content")
-            if (
-                message.get("role") == "assistant"
-                and isinstance(content, str)
-                and not content.strip()
-                and not any(
-                    key in message
-                    for key in ("tool_calls", "reasoning_content", "thinking_blocks")
-                )
-            ):
+            if message.get("_command") or is_summary_checkpoint(message) or self._is_empty_assistant(message):
                 continue
             if seen == position:
                 return self.last_archived + offset
             seen += 1
         return None
+
+    @staticmethod
+    def _replay_start_index(messages: list[dict[str, Any]]) -> int:
+        # Align before filtering the hidden checkpoint user marker: it anchors
+        # an assistant-leading tail at the committed raw boundary. Preserve a
+        # proactive delivery immediately before the first user turn as well.
+        start = 0
+        for i, message in enumerate(messages):
+            if message.get("role") == "user":
+                start = i - 1 if i > 0 and messages[i - 1].get("_channel_delivery") else i
+                break
+        return start + find_legal_message_start(messages[start:])
+
+    @staticmethod
+    def _is_empty_assistant(message: dict[str, Any]) -> bool:
+        content = message.get("content", "")
+        return (
+            message.get("role") == "assistant"
+            and isinstance(content, str)
+            and not content.strip()
+            and not any(key in message for key in ("tool_calls", "reasoning_content", "thinking_blocks"))
+        )
 
     def _history(
         self, max_messages: int = 0, *, max_tokens: int = 0, extend_to_user: bool = False,
@@ -257,17 +261,7 @@ class Session:
             )
         sliced = replayable[start_idx:]
 
-        # Avoid starting mid-turn when possible, except for proactive
-        # assistant deliveries that the user may be replying to.
-        for i, message in enumerate(sliced):
-            if message.get("role") == "user":
-                start = i
-                if i > 0 and sliced[i - 1].get("_channel_delivery"):
-                    start = i - 1
-                sliced = sliced[start:]
-                break
-
-        start = find_legal_message_start(sliced)
+        start = self._replay_start_index(sliced)
         if start:
             sliced = sliced[start:]
 
@@ -281,6 +275,8 @@ class Session:
             )
             if not include_runtime_context:
                 message = public_history_message(message)
+            if self._is_empty_assistant(message):
+                continue
             content = message.get("content", "")
             role = message.get("role")
             if role == "user" and view != "model" and isinstance(content, list):
@@ -312,9 +308,6 @@ class Session:
                 if cli_lines:
                     breadcrumbs = "\n".join(cli_lines)
                     content = f"{content}\n{breadcrumbs}" if content else breadcrumbs
-            if role == "assistant" and isinstance(content, str) and not content.strip():
-                if not any(key in message for key in ("tool_calls", "reasoning_content", "thinking_blocks")):
-                    continue
             entry: dict[str, Any] = {"role": message["role"], "content": content}
             if include_runtime_context and "input_id" in message and not is_hidden_history_message(message):
                 entry["_meta"] = {"input_id": message["input_id"]}
@@ -338,20 +331,26 @@ class Session:
                 used += tokens
             kept.reverse()
 
-            # Keep history aligned to the first visible user turn.
-            first_user = next((i for i, m in enumerate(kept) if m.get("role") == "user"), None)
-            if first_user is not None:
-                kept = kept[first_user:]
-            else:
-                # Tight token budgets can otherwise leave assistant-only tails.
-                # If a user turn exists in the unsliced output, recover the
-                # nearest one even if it slightly exceeds the token budget.
-                recovered_user = next(
-                    (i for i in range(len(out) - 1, -1, -1) if out[i].get("role") == "user"),
-                    None,
-                )
-                if recovered_user is not None:
-                    kept = out[recovered_user:]
+            # Keep history aligned to the first visible user turn, except for a
+            # deliberately assistant-leading verbatim tail: its checkpoint
+            # marker already carries the archived context, so dropping the
+            # retained leading assistant turns would lose replayed messages.
+            assistant_tail = is_summary_checkpoint(replayable[0]) and out[0]["role"] == "assistant"
+            if not assistant_tail:
+                first_user = next((i for i, m in enumerate(kept) if m.get("role") == "user"), None)
+                if first_user is not None:
+                    kept = kept[first_user:]
+                else:
+                    # Tight token budgets can otherwise leave assistant-only
+                    # tails. If a user turn exists in the unsliced output,
+                    # recover the nearest one even if it slightly exceeds the
+                    # token budget.
+                    recovered_user = next(
+                        (i for i in range(len(out) - 1, -1, -1) if out[i].get("role") == "user"),
+                        None,
+                    )
+                    if recovered_user is not None:
+                        kept = out[recovered_user:]
 
             # And keep a legal tool-call boundary at the front.
             start = find_legal_message_start(kept)

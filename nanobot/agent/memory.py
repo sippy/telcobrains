@@ -1396,7 +1396,7 @@ class Consolidator:
         cut = self._context_governor.select_prefix_cut(
             config, raw, len(raw), budget,
             wrapper, previous_summary, [], config.tools.get_definitions(),
-            replay_starts_at_user=True,
+            session_compaction=True,
             next_turn_input_reserve_tokens=config.next_turn_input_reserve_tokens,
         )
         if cut is None:
