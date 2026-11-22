@@ -24,8 +24,10 @@ from nanobot.bus.events import InboundMessage
 from nanobot.bus.queue import MessageBus
 from nanobot.bus.runtime_events import TurnRunStatusChanged
 from nanobot.config import Config
+from nanobot.config.schema import ModelPresetConfig
 from nanobot.nanobot import Nanobot
 from nanobot.providers.base import GenerationSettings, LLMProvider, LLMResponse, ToolCallRequest
+from nanobot.providers.factory import ProviderSnapshot
 from nanobot.session.manager import SESSION_CACHE_MAX_SIZE, SessionManager
 from nanobot.session.webui_turns import WebuiTurnRoutePolicy
 from nanobot.utils.llm_runtime import LLMRuntime
@@ -84,6 +86,63 @@ async def test_direct_turn_waits_for_child_without_a_background_consumer(loop_fa
         assert next(iter(loop.subagents.statuses_for_session("cli:direct").values())).state == "done"
     finally:
         await loop.subagents.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("wait", [False, True])
+async def test_child_model_preset_preserves_parent_runtime_and_task_ownership(tmp_path, wait):
+    parent = MagicMock(spec=LLMProvider, provider_name="parent")
+    parent.get_default_model.return_value = "parent-model"
+    parent.generation = GenerationSettings()
+    child = MagicMock(spec=LLMProvider, provider_name="child")
+    child.chat_stream_with_retry = AsyncMock(return_value=LLMResponse(content="Child findings"))
+    preset = ModelPresetConfig(model="child-model", max_tokens=2048, context_window_tokens=32000)
+    loop = AgentLoop(
+        MessageBus(), parent, tmp_path, model_presets={"local": preset},
+        preset_snapshot_loader=lambda name: ProviderSnapshot(
+            provider=child, model=preset.model, context_window_tokens=preset.context_window_tokens,
+            signature=(name,), generation=preset.to_generation_settings(), model_preset=name,
+        ),
+    )
+    runtime = loop.llm_runtime()
+    ctx = RequestContext("websocket", "topic", session_key="websocket:topic", runtime=runtime)
+    try:
+        with request_context(ctx):
+            missing = await loop.tools.execute("subagent", {
+                "action": "create", "task": "Inspect the configuration", "model_preset": "missing",
+            })
+            assert is_tool_error_result(missing)
+            assert "model_preset 'missing' not found" in missing
+            assert "Available: local" in missing
+            blank = await loop.tools.execute("subagent", {
+                "action": "create", "task": "Inspect the configuration", "model_preset": " ",
+            })
+            assert is_tool_error_result(blank)
+            assert "model_preset must be a non-empty string" in blank
+            assert not loop.subagents.statuses_for_session(ctx.session_key)
+            result = await loop.tools.execute("subagent", {
+                "action": "create", "task": "Inspect the configuration", "model_preset": "local", "wait": wait,
+            })
+        if wait:
+            assert result == "Child findings"
+        else:
+            assert "started" in result
+            await settled(loop.subagents)
+        status, = loop.subagents.statuses_for_session(ctx.session_key).values()
+        assert status.state == "done"
+        assert status.result == "Child findings"
+        if not wait:
+            notice = await asyncio.wait_for(loop.bus.consume_inbound(), timeout=2)
+            assert notice.session_key == ctx.session_key
+            assert notice.metadata["subagent_task_id"] == status.task_id
+            assert "Child findings" in notice.content
+        child.chat_stream_with_retry.assert_awaited_once()
+        assert child.chat_stream_with_retry.call_args.kwargs["model"] == "child-model"
+        assert child.chat_stream_with_retry.call_args.kwargs["max_tokens"] == 2048
+        assert loop.llm_runtime() == runtime
+        assert loop.provider is parent
+    finally:
+        await loop.aclose()
 
 
 @pytest.mark.asyncio

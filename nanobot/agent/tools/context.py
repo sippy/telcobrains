@@ -105,3 +105,4 @@ class ToolContext:
     timezone: str = "UTC"
     workspace_sandbox: WorkspaceSandboxStatus | None = None
     runtime_control: RuntimeControl | None = None
+    resolve_model_preset: Callable[[str], LLMRuntime] | None = None

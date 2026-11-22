@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Callable
 from typing import TYPE_CHECKING, Any
 
 from nanobot.agent.subagent import SubagentControlError
@@ -20,6 +21,7 @@ from nanobot.session.manager import SessionPolicy
 if TYPE_CHECKING:
     from nanobot.agent.subagent import SubagentManager
     from nanobot.agent.tools.context import ToolContext
+    from nanobot.utils.llm_runtime import LLMRuntime
 
 
 @tool_parameters(tool_parameters_schema(
@@ -30,8 +32,12 @@ if TYPE_CHECKING:
     ),
     task=StringSchema("Required for create: the task for the subagent to complete.", min_length=1),
     label=StringSchema("Display label for create."),
+    model_preset=StringSchema(
+        "For create: configured model preset for the child only. Omit to use the parent turn's model.",
+        min_length=1,
+    ),
     temperature=NumberSchema(
-        description="Sampling temperature for create; inherits the parent's runtime if omitted.",
+        description="Sampling temperature for create; uses the selected runtime's temperature if omitted.",
         minimum=0.0,
         maximum=2.0,
     ),
@@ -57,14 +63,19 @@ if TYPE_CHECKING:
 class SubagentTool(Tool):
     """Manage the current session's private subagent tasks."""
 
-    def __init__(self, manager: SubagentManager):
+    def __init__(
+        self,
+        manager: SubagentManager,
+        resolve_model_preset: Callable[[str], LLMRuntime] | None = None,
+    ):
         self._manager = manager
+        self._resolve_model_preset = resolve_model_preset
 
     @classmethod
     def create(cls, ctx: ToolContext) -> Tool:
         if ctx.subagent_manager is None:
             raise RuntimeError("SubagentTool requires an initialized subagent manager")
-        return cls(ctx.subagent_manager)
+        return cls(ctx.subagent_manager, ctx.resolve_model_preset)
 
     @property
     def name(self) -> str:
@@ -86,12 +97,13 @@ class SubagentTool(Tool):
     async def execute(
         self, action: str, task_id: str | None = None, message: str | None = None,
         task: str | None = None, label: str | None = None,
-        temperature: float | None = None, wait: bool = False, **kwargs: Any,
+        temperature: float | None = None, wait: bool = False,
+        model_preset: str | None = None, **kwargs: Any,
     ) -> str:
         if action == "create":
             if not task or not task.strip():
                 return ToolResult.error("Error: create requires a non-empty task")
-            return await self._create_task(task, label, temperature, wait)
+            return await self._create_task(task, label, temperature, wait, model_preset)
         owner = current_request_session_key()
         try:
             if action == "check":
@@ -116,6 +128,7 @@ class SubagentTool(Tool):
 
     async def _create_task(
         self, task: str, label: str | None, temperature: float | None, wait: bool,
+        model_preset: str | None,
     ) -> str:
         request_ctx = current_request_context()
         if request_ctx is None or request_ctx.runtime is None:
@@ -127,11 +140,22 @@ class SubagentTool(Tool):
         )
         if not session_key:
             return ToolResult.error("Error: create requires an active session identity")
+        runtime = request_ctx.runtime
+        if model_preset is not None:
+            if self._resolve_model_preset is None:
+                return ToolResult.error("Error: subagent model preset selection is unavailable.")
+            try:
+                runtime = self._resolve_model_preset(model_preset)
+            except KeyError as exc:
+                detail = exc.args[0] if exc.args else f"Model preset {model_preset!r} not found."
+                return ToolResult.error(f"Error: {detail}")
+            except ValueError as exc:
+                return ToolResult.error(f"Error: could not resolve subagent model preset {model_preset!r}: {exc}")
         inline = wait or not request_ctx.can_receive_background_results or not request_ctx.persist_session
         method = self._manager.run_inline if inline else self._manager.spawn
         return await method(
             task=task,
-            runtime=request_ctx.runtime,
+            runtime=runtime,
             label=label,
             origin_channel=origin_channel,
             origin_chat_id=origin_chat_id,

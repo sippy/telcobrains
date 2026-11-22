@@ -126,6 +126,7 @@ nanobot includes built-in tools for files, shell commands, web search/fetch, ima
 
 nanobot can delegate parts of a complex request to subagents while staying responsible for your final answer. Inside the same conversation, you can ask it to check progress, send follow-up instructions, wait for results, or cancel a specific subtask.
 
+- A subagent uses the parent turn’s model by default. To use a different configured model, ask nanobot to delegate to a named preset (for example, “Run this subtask using `local-qwen-sglang`”). The `subagent` tool accepts `model_preset` when creating a task. This changes only the child’s model, not the parent topic’s preset or where the subtask appears.
 - Background subtasks report back to the conversation that started them.
 - `/stop` stops the current session and its subagents without affecting other sessions (it does not undo file changes already made).
 - Subagents belong to their parent conversation: deleting that conversation stops and removes them, and forking does not copy them.
