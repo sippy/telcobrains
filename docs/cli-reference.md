@@ -156,6 +156,19 @@ Non-interactive input/output, `--logs`, and `--no-markdown` automatically retain
 
 Interactive mode exits with `exit`, `quit`, `/exit`, `/quit`, `:q`, or `Ctrl+D`. Use `/detach` instead to close the TUI without stopping the shared gateway or its active agent work. The restored terminal prints a copyable stop command with the same `--config` and explicit `--workspace` selectors.
 
+### Import an OpenClaw conversation
+
+From the nanobot source checkout, use a Python environment with nanobot's dependencies installed. Use Python 3.14 or newer for Zstandard-compressed OpenClaw events.
+
+```bash
+python -m scripts.import_openclaw_session SESSION_UUID --dry-run
+python -m scripts.import_openclaw_session SESSION_UUID
+```
+
+The script reads the active transcript of one session from the main OpenClaw agent's SQLite database without modifying it. Use `--source-db PATH` for a different agent or installation and `--config PATH` or `--workspace PATH` to select an existing nanobot workspace. Legacy JSONL and cold-archived transcripts are not supported. The import copies visible user and assistant text and timestamps, not attachments, tool activity, or runtime state.
+
+Refresh the WebUI to find the new conversation marked **(OpenClaw)**. Running the same import again does not duplicate messages or sync later changes. It can also repair an unchanged canonical-only import made with the same session key and source metadata.
+
 ## WebUI
 
 | Command | Description |
