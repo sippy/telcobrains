@@ -1,0 +1,9 @@
+# Running SUPERTURN on nanobot
+
+Use this adapter only when nanobot delegation is authorized. Confirm which capabilities are exposed in the owning conversation before starting.
+
+- Use `subagent.create` for a placement acknowledgement, with `wait: false` or omitted. Use the returned `task_id` to inspect the task and associate its result with the assignment. Use the completion notification when the host supports background tasks; some hosts force inline execution. An optional `model_preset` selects the child's route, not the execution host. Verify the route against the run's model policy.
+- After the acknowledgement completes and placement is verified, issue GO via `subagent.follow_up` from the owning persistent conversation, without `wait: true`. Record the new task ID for each follow-up. Use `send` only for queued or active workers; queuing a message is not proof it was read. `cancel` requests a stop, not a checkpoint; verify the task settled and check the durable evidence and owned resources separately. Use explicit worktree and evidence paths; an instruction in the task is not a filesystem sandbox.
+- Use an explicit manual-controller plan unless the [scheduler preflight](scheduling.md) passes. Nanobot's `cron` binds jobs to the creating chat and automatically returns the final reply there. It does not expose an explicit per-job model/account or alternate controller target. Before relying on it, verify the effective inference route, owning-conversation access to the intended worker, tool scope, and delivery in a harmless scheduled turn. Do not assume a scheduled turn can do everything a normal controller turn can do, and do not send a second copy of its final report.
+
+These are tool mappings, not proof of an end-to-end runtime pilot. Do not use a different toolkit, model route, or host to work around a missing capability.

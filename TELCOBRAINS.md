@@ -28,6 +28,10 @@ Foreground context-pressure compaction, idle archival, manual `/compact`, and SD
 
 Limitations: if the input does not fit the compactor's context window or the call fails, nanobot writes a raw (unsummarized) checkpoint instead, with no retry. If the compactor is a different provider than the session model, provider-native compaction summarizes the materialized transcript instead of resuming the foreign provider's private state. This is model routing and replay sizing only. See [Compactor](docs/configuration.md#compactor).
 
+## SUPERTURN workspace skill
+
+The portable [SUPERTURN skill](skills/telcobrains/superturn/SKILL.md) is adapted from the OpenClaw copy for bounded assignments with Git-backed evidence and controller review. Copy the entire `skills/telcobrains/superturn/` directory to `<workspace>/skills/superturn/` so nanobot discovers it alongside other workspace skills and can still resolve its references and template. The repository copy is not a built-in skill. Installing it does not start workers or create scheduled jobs.
+
 ## Local deployment settings (outside Git)
 
 - Pending rollout: set `agents.defaults.maxToolIterations` to `1000` in the host's `~/.nanobot/config.json`. This sets the ordinary budget for the main agent and each subagent run, including follow-ups. An iteration is a model round and may include multiple tool calls. The upstream default remains `200`. Verify the effective gateway value with `my(action="check", key="max_iterations")` after applying the change.

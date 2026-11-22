@@ -1,0 +1,154 @@
+# Illustrative contract data, NOT a supported tool payload or executable config.
+# Every <...> must be resolved before dispatch. Null means deliberately unused
+# only for optional fields. Never load this example as an active run.
+protocol_version: superturn-v0.2
+mode: proposal                    # change to execute only for an authorized run
+run_id: <globally-unique-run-id>
+goal: <measurable-outcome>
+owner: <verified-requester-or-team-id>
+
+workspace:
+  host_id: <actual-host-or-environment-id>
+  project_root: <absolute-project-path>
+  run_root: <absolute-project-owned-run-path>
+  checkout: <worktree-path-or-explicit-current-checkout>
+  base_revision: <commit-or-not-applicable-with-reason>
+
+repository:
+  path: <absolute-shared-local-repository>
+  controller_checkout: <absolute-mainline-checkout>
+  mainline_branch: <actual-mainline-branch>
+  worktree_root: <absolute-sibling-worktree-root>
+  branch_pattern: st/<run>/<lane>/ST<n>
+  tag_pattern: st/<run>/<lane>/ST<n>
+  evidence_pattern: evidence/<run>/<lane>/ST<n>/
+  retention: permanent_turn_tags_no_history_rewrite
+  per_file_checksums: external_payloads_only
+
+disk_budget:
+  limit_bytes: <user-approved-positive-integer>
+  approval_ref: <user-instruction-reference>
+  temporary_overrun_bytes: 0      # explicit small approved allowance, if any
+  scope: []                      # absolute roots/storage IDs; all project lanes
+  shared_project_ledger: <project-wide-accounting-ledger>
+  exclusions: []                 # explicit rationale; no hidden offloading
+  accounting_method: <allocated-bytes-and-shared-storage-treatment>
+  baseline_bytes: <measured-nonnegative-integer>
+  baseline_measured_at_utc: <timestamp>
+  last_measured_bytes: null
+  last_measured_at_utc: null
+  next_cleanup: <checkpoint-identity-or-time>
+  status: UNVERIFIED              # WITHIN_BUDGET | TEMPORARY_OVERRUN | BLOCKED_DISK_BUDGET
+  hold: false                    # survives timers/restarts; blocks substantive GO
+  cleanup_passes: []              # before/after bytes, reclaimed targets, blockers
+  reclamation_review: []          # largest consumers/value; oldest evidence archival;
+                                 # retrieval checks, net savings, per-option blockers
+
+controller:
+  runtime: <runtime-family>
+  identity: <exact-session-or-process-identity>
+  state_revision: 0
+  single_writer: true
+  scheduled_execution_target: null # null = no scheduled controller
+
+reporting:
+  publisher: controller
+  conversation_id: <verified-requesting-conversation>
+  channel: <verified-surface>
+  account_id: null
+  target: null                     # null when live source-delivery supplies it
+  thread_id: null
+  delivery_adapter: <live-runtime-delivery-contract>
+  worker_direct_external_send: false
+
+cadence:
+  policy: progress_review          # default; alternative: deadline
+  progress_review_minutes: 30      # review does not automatically wrap a turn
+  deadline_duration_minutes: null # deadline mode: set duration OR absolute end
+  deadline_at_utc: null
+  wrap_lead_minutes: 5             # deadline mode; progress mode: set on notice
+  review_grace_minutes: 5          # deadline mode; not extra execution authority
+  deadline_enforcement: cooperative # do not claim hard limits without a mechanism
+  scheduler_adapter: manual        # manual requires an available controller
+  job_ids: []                     # bind existing receipts; never infer absence
+  inference_binding: null        # authorized model/route and account ref if applicable
+  scheduler_readiness: UNVERIFIED # READY only after readback + real safe test
+  job_verification: []            # per job: ID, effective inference binding, next slot,
+                                 # enabled state, preflight run ID/result;
+                                 # separately track delivery and consumption
+
+authority:
+  allowed_actions: [<explicit-scope>]
+  forbidden_actions: [<explicit-exclusions>]
+  local_only: true                # default applies to workers and descendants
+  local_environment_id: <verified-current-local-workspace-environment>
+  non_local_user_grants: []        # exact user instruction + scoped resource IDs;
+                                 # never infer from availability or delegation
+  required_dispatch_toolkit: null # bind explicit user choice; no silent fallback
+  allowed_worker_model_routes: [] # bind authorized routes; no cloud substitution
+  parallel_lanes_authorized: false
+  max_active_lanes: 1
+  max_turns_per_lane: <positive-integer>
+  stop_at_utc: <absolute-overall-end>
+  spend_limit: <approved-limit-or-no-paid-services>
+  completion_rule: park_when_goal_met
+  hold: false
+
+lanes:
+  - lane_id: <run-local-lane-id>
+    goal: <bounded-lane-goal>
+    runtime: <verified-worker-runtime-family>
+    execution_environment_id: <verified-local-or-explicitly-authorized-environment>
+    locality_verified: false      # verify before spawn; toolkit is not locality
+    non_local_grant_ref: null     # required for every non-local assignment
+    worker_handle: null            # controller records actual returned identity
+    completion_route: <worker-to-controller-event-or-return>
+    followup_adapter: <runtime-specific-operation>
+    work_root: <absolute-isolated-mutable-root>
+    evidence_root: <absolute-lane-evidence-root>
+    model_policy: <resolved-model-and-applicable-budgets>
+    tool_limits: <actual-runtime-limits>
+    resource_grants: []            # stable identities + exclusivity/owner
+    resource_exclusions: []
+    cleanup_policy: <owned-job-stop-and-verification-procedure>
+    turn_number: 1
+    generation: 1
+    state: UNBOUND
+    base_commit: null             # controller resolves current mainline at start
+    branch: null                  # unique run/lane/turn branch before GO
+    turn_tag: null                # controller records at finalization
+    submitted_commit: null        # includes report and all retained evidence
+    merge_commit: null
+    worktree_retired: false
+    next_progress_review_utc: null # progress-review mode, no automatic stop
+    review_sequence: 0
+    deadline_utc: null             # deadline mode only
+    wrap_target_utc: null          # deadline or explicit controller wrap notice
+    resource_state: unallocated    # owned | released | handed_off | UNKNOWN
+    handshake: pending
+
+# Controller validation requirements (proposed, not implemented here):
+# - Reject unresolved placeholders, invalid types/timestamps and missing roots.
+# - Require approved project disk limit, bounded headroom and measured scope before GO.
+# - Aggregate all project lanes/storage; no per-turn reset or hidden relocation.
+# - At cleanup/final closeout require measured bytes <= base limit, not overrun ceiling.
+# - Repeat safe cleanup passes or hold BLOCKED_DISK_BUDGET for the user's decision.
+# - Preserve provenance/retention; no automatic quota increase or history pruning.
+# - Verify workspace/host/checkout and controller/report identities separately.
+# - Reject non-local dispatch absent an explicit task/resource-specific user grant.
+# - Verify actual locality before spawn; honor required toolkit and model routes.
+# - Carry resource/toolkit restrictions into all briefs, jobs and descendants.
+# - Verify runtime tools, placement, follow-up, schedule scope and model access.
+# - For each model-backed job verify the authorized inference binding;
+#   read back saved inference readiness and verify a harmless real execution.
+# - Do not issue scheduled worker GO with an UNVERIFIED/BLOCKED backstop.
+# - Preserve holds and selected timing policy; verify recovery before reliance.
+# - Validate progress_review_minutes > 0; deadline mode requires exactly one
+#   duration/end value; never treat progress-check due time as a stop deadline.
+# - Create branch/worktree from current mainline; verify base and paths before GO.
+# - Commit evidence/report, review/merge/tag, verify retrieval and clean/quiescent
+#   state before removing a worktree. Retain tags; no forced removal/ref rewrite.
+# - Verify explicit authority before parallelism, paid use or external actions.
+# - Confirm no conflicting lane/resource grants; preserve all exclusions/holds.
+# - Record returned handles and validate handshake before substantive work.
+# - Enforce run/turn/generation idempotency and overall turn/time/spend limits.
