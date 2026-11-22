@@ -7,6 +7,9 @@ Result:
 {% if stop_reason %}
 Exit reason: {{ stop_reason }}
 {% endif %}
+{% if stop_reason == "max_iterations" %}
+This run stopped at its iteration limit without completing the task. You can resume it with a subagent follow_up: the follow-up starts a linked run from the saved conversation and tool results with a fresh full iteration budget. Old tool calls are not rerun and no processes are restored.
+{% endif %}
 {% if error %}
 Error: {{ error }}
 {% endif %}

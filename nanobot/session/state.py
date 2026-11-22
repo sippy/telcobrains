@@ -22,7 +22,8 @@ from nanobot.session.manager import (
     fork_session,
 )
 from nanobot.session.sqlite_store import SessionConflictError, SqliteSessionStore
-from nanobot.session.types import PARENT_SESSION_KEY, SessionTypes
+from nanobot.session.summary import session_summary_from_metadata
+from nanobot.session.types import PARENT_SESSION_KEY, SESSION_TYPE_KEY, SessionTypes
 from nanobot.utils.cancellation import shield_and_drain
 
 _T = TypeVar("_T")
@@ -487,7 +488,7 @@ class SessionState:
 
     async def create_child(
         self, parent_key: str, key: str, *, metadata: Mapping[str, Any],
-        content: str, policy: SessionPolicy,
+        content: str, policy: SessionPolicy, source_key: str | None = None,
     ) -> Session:
         """Establish a child and its parent before execution leaves the owner."""
         values = deepcopy(dict(metadata))
@@ -508,6 +509,20 @@ class SessionState:
                 )
                 child = Session(key=key, policy=effective, metadata=values)
                 child.metadata[PARENT_SESSION_KEY] = parent_key
+                if source_key is not None:
+                    source = self._load(source_key)
+                    if (source is None or not source.policy.persist or not effective.persist
+                            or source.metadata.get(PARENT_SESSION_KEY) != parent_key
+                            or source.metadata.get(SESSION_TYPE_KEY) != values.get(SESSION_TYPE_KEY)):
+                        raise SessionConflictError("source task history is unavailable")
+                    child.policy = replace(
+                        effective, log_content=effective.log_content and source.policy.log_content,
+                        disabled_tools=effective.disabled_tools | source.policy.disabled_tools,
+                    )
+                    summary = session_summary_from_metadata(source.metadata, fallback_last_active=source.updated_at)
+                    if summary is not None:
+                        child.add_message("user", f"Previous task context (saved summary):\n{summary['text']}")
+                    child.messages.extend(deepcopy(source.get_history()))
                 child.add_message("user", content)
                 self._commit(child)
                 return child
@@ -516,7 +531,8 @@ class SessionState:
             self._publish(child)
             return self._draft(child)
 
-        return await self._execute((parent_key, key), create, operation_name="create_child")
+        keys = (parent_key, key) if source_key is None else (parent_key, key, source_key)
+        return await self._execute(keys, create, operation_name="create_child")
 
     @staticmethod
     def _refresh(draft: Session, fresh: Session) -> None:

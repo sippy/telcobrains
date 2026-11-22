@@ -68,6 +68,7 @@ class SubagentSessions:
             status.owner, self.key(status.task_id),
             metadata={SESSION_TYPE_KEY: SUBAGENT.name, TASK_METADATA_KEY: self._payload(status)},
             content=status.task_description, policy=policy or SessionPolicy(),
+            source_key=self.key(status.continued_from_task_id) if status.continued_from_task_id else None,
         )
 
     async def save(self, status: SubagentStatus) -> bool:

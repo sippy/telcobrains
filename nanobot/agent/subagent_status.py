@@ -39,6 +39,8 @@ class SubagentStatus:
     created_at: float = field(default_factory=time.time)
     completed_at: float | None = None
     revision: int = 0
+    model_preset: str | None = None
+    continued_from_task_id: str | None = None
 
     def as_dict(self) -> dict[str, object]:
         """Serialize task observations without exposing ownership or resources."""
@@ -46,6 +48,8 @@ class SubagentStatus:
         return {
             "task_id": self.task_id,
             "revision": self.revision,
+            "model_preset": self.model_preset,
+            "continued_from_task_id": self.continued_from_task_id,
             "origin_message_id": self.origin_message_id,
             "origin_turn_id": self.origin_turn_id,
             "created_at": self.created_at,

@@ -49,6 +49,7 @@ from nanobot.security.workspace_access import (
     workspace_sandbox_status,
 )
 from nanobot.session.manager import Session, SessionManager, SessionPolicy
+from nanobot.session.sqlite_store import SessionConflictError
 from nanobot.utils.cancellation import shield_and_drain
 from nanobot.utils.llm_runtime import LLMRuntime
 from nanobot.utils.prompt_templates import render_template
@@ -382,6 +383,27 @@ class SubagentManager:
             raise SubagentControlError("task unavailable")
         return status, child
 
+    def follow_up_source(self, task_id: str, owner: str | None) -> SubagentStatus:
+        """Authorize a continuation without loading or exposing its transcript."""
+        status = self.check(task_id, owner)
+        if self.sessions is None:
+            raise SubagentControlError("follow-up requires saved task history")
+        if status.state in {"queued", "running"}:
+            raise SubagentControlError("task is still active; use send to give it a follow-up")
+        if status.state == "stopping":
+            raise SubagentControlError("task is still finalizing; try again shortly")
+        resumable = status.state in {"done", "cancelled"} or (
+            status.state == "incomplete" and status.stop_reason == "max_iterations"
+        )
+        if not resumable:
+            raise SubagentControlError(
+                "follow-up requires a completed, cancelled, or iteration-limit task "
+                f"(current state: {status.state})"
+            )
+        if task_id in self._running_tasks:
+            raise SubagentControlError("task is still finalizing; try again shortly")
+        return status
+
     async def send(self, task_id: str, owner: str | None,
              message: str | None) -> SubagentMessageReceipt:
         """Accept a bounded follow-up only while execution is open."""
@@ -583,7 +605,7 @@ class SubagentManager:
         session_key: str | None, origin_message_id: str | None,
         temperature: float | None, workspace_scope: WorkspaceScope | None,
         runtime: LLMRuntime | None, *, announce: bool, origin_turn_id: str | None,
-        session_policy: SessionPolicy | None,
+        session_policy: SessionPolicy | None, continued_from_task_id: str | None,
     ) -> _SubagentTask:
         self.bus.admission.check()
         if runtime is None:
@@ -594,6 +616,11 @@ class SubagentManager:
         if self._closed or len(self._tasks) + self._admitting >= self.MAX_ACTIVE:
             raise SubagentControlError("subagent manager is closed or at task capacity")
         owner = session_key or f"{origin_channel}:{origin_chat_id}"
+        if continued_from_task_id is not None:
+            if self.sessions is None or (session_policy is not None and not session_policy.persist):
+                raise SubagentControlError("follow-up requires saved task history")
+            source = self.follow_up_source(continued_from_task_id, owner)
+            label = label or f"Follow-up: {source.label}"
         task_id = str(uuid.uuid4())
         status = SubagentStatus(
             task_id=task_id,
@@ -604,6 +631,8 @@ class SubagentManager:
             owner=owner,
             origin_message_id=origin_message_id,
             origin_turn_id=origin_turn_id,
+            model_preset=runtime.model_preset,
+            continued_from_task_id=continued_from_task_id,
         )
         self._admitting += 1
         try:
@@ -611,6 +640,10 @@ class SubagentManager:
                 admission = asyncio.create_task(self.sessions.create(status, policy=session_policy))
                 try:
                     child = await shield_and_drain(admission)
+                except SessionConflictError as exc:
+                    if continued_from_task_id is None:
+                        raise
+                    raise SubagentControlError("source task history is unavailable") from exc
                 except asyncio.CancelledError:
                     if not admission.cancelled() and admission.exception() is None:
                         child = admission.result()
@@ -663,13 +696,14 @@ class SubagentManager:
         runtime: LLMRuntime | None = None,
         origin_turn_id: str | None = None,
         session_policy: SessionPolicy | None = None,
+        continued_from_task_id: str | None = None,
     ) -> str:
         """Start background work and route its terminal result to the parent."""
         try:
             record = await self._create_task(
                 task, label, origin_channel, origin_chat_id, session_key,
                 origin_message_id, temperature, workspace_scope, runtime, announce=True, origin_turn_id=origin_turn_id,
-                session_policy=session_policy,
+                session_policy=session_policy, continued_from_task_id=continued_from_task_id,
             )
         except SubagentControlError as exc:
             return ToolResult.error(f"Error: {exc}")
@@ -691,13 +725,14 @@ class SubagentManager:
         runtime: LLMRuntime | None = None,
         origin_turn_id: str | None = None,
         session_policy: SessionPolicy | None = None,
+        continued_from_task_id: str | None = None,
     ) -> str:
         """Wait for the same task lifecycle without a background notice."""
         try:
             record = await self._create_task(
                 task, label, origin_channel, origin_chat_id, session_key,
                 origin_message_id, temperature, workspace_scope, runtime, announce=False, origin_turn_id=origin_turn_id,
-                session_policy=session_policy,
+                session_policy=session_policy, continued_from_task_id=continued_from_task_id,
             )
         except SubagentControlError as exc:
             return ToolResult.error(f"Error: {exc}")
@@ -717,7 +752,18 @@ class SubagentManager:
             error = record.status.error or result
             return ToolResult.error(error + (f"\nPartial result:\n{result}" if error != result else ""))
         if record.status.state == "incomplete":
-            return ToolResult.error(f"Task incomplete ({record.status.stop_reason}).\n{result}")
+            hint = ""
+            if (
+                record.status.stop_reason == "max_iterations"
+                and self.sessions is not None
+                and record.session.policy.persist
+            ):
+                hint = (
+                    f"\nTask ID: {record.status.task_id}\n"
+                    "Resume this run with subagent follow_up using that task_id: it continues "
+                    "from the saved history and tool results with a fresh full iteration budget."
+                )
+            return ToolResult.error(f"Task incomplete ({record.status.stop_reason}).\n{result}{hint}")
         return result
 
     def _task_done(self, record: _SubagentTask, task: asyncio.Task[str]) -> None:
@@ -741,8 +787,6 @@ class SubagentManager:
 
     async def _save_transcript(self, record: _SubagentTask) -> None:
         if self.sessions is not None:
-            from nanobot.session.sqlite_store import SessionConflictError
-
             try:
                 await self.sessions.sessions.state.finish_turn(record.session)
             except SessionConflictError:

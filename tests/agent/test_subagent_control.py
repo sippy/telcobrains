@@ -146,6 +146,95 @@ async def test_child_model_preset_preserves_parent_runtime_and_task_ownership(tm
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("wait", [False, True])
+@pytest.mark.parametrize("cancelled", [False, True], ids=["completed-source", "cancelled-source"])
+async def test_follow_up_replays_owned_subagent_history_after_restart(tmp_path, wait, cancelled):
+    (tmp_path / "note.txt").write_text("The launch code is violet", encoding="utf-8")
+    owner = "websocket:topic"
+    preset = ModelPresetConfig(model="local-model", context_window_tokens=32000)
+
+    def open_loop(responses):
+        parent = MagicMock(spec=LLMProvider, provider_name="parent")
+        parent.get_default_model.return_value = "parent-model"
+        parent.generation = GenerationSettings()
+        child = MagicMock(spec=LLMProvider, provider_name="local")
+        child.chat_stream_with_retry = AsyncMock(side_effect=responses)
+        loop = AgentLoop(
+            MessageBus(), parent, tmp_path, model_presets={"local": preset},
+            preset_snapshot_loader=lambda name: ProviderSnapshot(
+                provider=child, model=preset.model, context_window_tokens=preset.context_window_tokens,
+                signature=(name,), generation=preset.to_generation_settings(), model_preset=name,
+            ),
+        )
+        return loop, child
+
+    read_note = LLMResponse(content=None, tool_calls=[ToolCallRequest("read", "read_file", {"path": "note.txt"})])
+    loop, child = open_loop([read_note, LLMResponse(content="I read the launch note.")])
+    awaiting_report = asyncio.Event()
+
+    async def stall_before_report(**kwargs):
+        if child.chat_stream_with_retry.await_count == 1:
+            return read_note
+        awaiting_report.set()
+        await asyncio.Future()
+
+    if cancelled:
+        child.chat_stream_with_retry.side_effect = stall_before_report
+    try:
+        with request_context(RequestContext("websocket", "topic", session_key=owner, runtime=loop.llm_runtime())):
+            result = await loop.tools.execute("subagent", {
+                "action": "create", "model_preset": "local", "task": "Read the launch note", "wait": not cancelled,
+            })
+        if cancelled:
+            assert "started" in result
+            await asyncio.wait_for(awaiting_report.wait(), timeout=2)
+            active, = loop.subagents.statuses_for_session(owner).values()
+            status = await loop.subagents.cancel(active.task_id, owner)
+            assert status.state == "cancelled"
+        else:
+            assert result == "I read the launch note."
+        original, = loop.subagents.statuses_for_session(owner).values()
+        _, history = loop.subagents.read_session(original.task_id, owner)
+    finally:
+        await loop.aclose()
+
+    # If the earlier tool is rerun or its result is not replayed, the follow-up cannot see this value.
+    (tmp_path / "note.txt").unlink()
+    loop, child = open_loop([LLMResponse(content="Violet.")])
+    follow_up = {"action": "follow_up", "task_id": original.task_id, "message": "What was the code?", "wait": wait}
+    try:
+        with request_context(RequestContext("websocket", "other", runtime=loop.llm_runtime())):
+            denied = await loop.tools.execute("subagent", follow_up)
+            assert is_tool_error_result(denied) and "task unavailable" in denied
+        ctx = RequestContext("websocket", "topic", session_key=owner, runtime=loop.llm_runtime(), turn_id="new-turn")
+        with request_context(ctx):
+            response = await loop.tools.execute("subagent", follow_up)
+        if wait:
+            assert response == "Violet."
+        else:
+            assert "started" in response
+            await settled(loop.subagents)
+            notice = await asyncio.wait_for(loop.bus.consume_inbound(), timeout=2)
+            assert notice.session_key == owner
+            assert "Violet." in notice.content
+        child.chat_stream_with_retry.assert_awaited_once()
+        call = child.chat_stream_with_retry.call_args.kwargs
+        assert call["model"] == "local-model"
+        assert call["messages"][-1]["content"] == "What was the code?"
+        assert any(m["role"] == "tool" and "The launch code is violet" in m["content"] for m in call["messages"])
+        assert loop.model == "parent-model"
+        task, = (t for t in loop.subagents.statuses_for_session(owner).values() if t.task_id != original.task_id)
+        assert task.continued_from_task_id == original.task_id
+        assert task.origin_turn_id == "new-turn"
+        assert task.result == "Violet."
+        original_after, unchanged = loop.subagents.read_session(original.task_id, owner)
+        assert original_after.state == ("cancelled" if cancelled else "done")
+        assert unchanged.messages == history.messages
+    finally:
+        await loop.aclose()
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("existing_parent", [False, True])
 @pytest.mark.parametrize("streamed", [False, True])
 async def test_sdk_ephemeral_delegation_never_persists_on_later_flush(
@@ -528,7 +617,125 @@ async def test_iteration_limit_returns_partial_findings_without_success_notice(t
     assert is_tool_error_result(inline)
     assert "max_iterations" in inline
     assert "verification is still pending" in inline
+    # A non-persistent run has no saved history, so no resume is advertised.
+    assert "follow_up" not in inline
+    assert "Task ID" not in inline
     await manager.close()
+
+
+@pytest.mark.asyncio
+async def test_iteration_limit_stops_are_resumable_with_saved_history_and_fresh_budget(tmp_path):
+    manager, provider, ctx = setup(
+        tmp_path, max_iterations=2, session_manager=SessionManager(tmp_path),
+    )
+    runtime = LLMRuntime.capture(
+        provider, "test", context_window_tokens=128000, model_preset="default",
+    )
+    ctx = RequestContext(
+        ctx.channel, ctx.chat_id, session_key=ctx.session_key, runtime=runtime,
+    )
+    (tmp_path / "note.txt").write_text("evidence", encoding="utf-8")
+    log = tmp_path / "executed.log"
+    calls = 0
+    requests: list[list[dict]] = []
+    tool = SubagentTool(manager, resolve_model_preset=lambda preset: runtime)
+
+    async def chat(**kwargs):
+        nonlocal calls
+        calls += 1
+        requests.append([dict(m) for m in kwargs["messages"]])
+        if calls == 6:
+            return LLMResponse(content="All steps finished.")
+        if calls % 2 == 1:
+            return LLMResponse(content=None, tool_calls=[ToolCallRequest(
+                f"step{calls}", "exec", {"command": f"echo step{calls} >> {shlex.quote(str(log))}"},
+            )])
+        return LLMResponse(content=None, tool_calls=[ToolCallRequest(
+            f"note{calls}", "read_file", {"path": "note.txt"},
+        )])
+
+    provider.chat_stream_with_retry = AsyncMock(side_effect=chat)
+    manager_closed = False
+    restarted: SubagentManager | None = None
+    try:
+        task_id = await spawn(manager, ctx)
+        await settled(manager)
+        status = json.loads(await control(manager, ctx, task_id))
+        assert status["state"] == "incomplete"
+        assert status["stop_reason"] == "max_iterations"
+        assert status["iteration"] == 1
+        assert log.read_text(encoding="utf-8").splitlines() == ["step1"]
+
+        # A follow-up starts a linked run that begins with its own full two-round budget.
+        with request_context(ctx):
+            first = await tool.execute(
+                "follow_up", task_id=task_id,
+                message="Continue with the remaining steps", wait=True,
+            )
+        assert is_tool_error_result(first)
+        assert "max_iterations" in first
+        second = next(
+            t for t in manager.statuses_for_session(ctx.session_key).values()
+            if t.continued_from_task_id == task_id
+        )
+        # The inline error names the stopped run so the caller can resume exactly this task.
+        assert second.task_id in first
+        assert "follow_up" in first
+        carried = requests[2]
+        tool_results = [m["content"] for m in carried if m.get("role") == "tool"]
+        assert any("evidence" in result for result in tool_results)
+        tool_call_names = [
+            tc["function"]["name"]
+            for m in carried if m.get("role") == "assistant" and m.get("tool_calls")
+            for tc in m["tool_calls"]
+        ]
+        assert "exec" in tool_call_names and "read_file" in tool_call_names
+        assert carried[-1] == {"role": "user", "content": "Continue with the remaining steps"}
+        assert log.read_text(encoding="utf-8").splitlines() == ["step1", "step3"]
+        second_status = json.loads(await control(manager, ctx, second.task_id))
+        assert second_status["state"] == "incomplete"
+        assert second_status["stop_reason"] == "max_iterations"
+        assert second_status["iteration"] == 1
+
+        # Repeated follow-ups keep receiving the full per-run budget: the host
+        # restarts before this run, which spends one tool round and a final
+        # answer inside its own two-round budget.
+        await manager.close()
+        manager_closed = True
+        restarted = SubagentManager(
+            workspace=tmp_path, bus=MessageBus(), max_tool_result_chars=16000,
+            consolidator=MagicMock(spec=Consolidator),
+            max_iterations=2, session_manager=SessionManager(tmp_path),
+        )
+        reopened_tool = SubagentTool(restarted, resolve_model_preset=lambda preset: runtime)
+        with request_context(ctx):
+            finished = await reopened_tool.execute(
+                "follow_up", task_id=second.task_id, message="Finish the task", wait=True,
+            )
+        assert finished == "All steps finished."
+        # The saved history and tool results survive the re-open and are replayed.
+        reopened = requests[4]
+        assert any("evidence" in m["content"] for m in reopened if m.get("role") == "tool")
+        assert reopened[-1] == {"role": "user", "content": "Finish the task"}
+        # No replay: every old tool call executed exactly once, in order.
+        assert log.read_text(encoding="utf-8").splitlines() == ["step1", "step3", "step5"]
+        third = next(
+            t for t in restarted.statuses_for_session(ctx.session_key).values()
+            if t.continued_from_task_id == second.task_id
+        )
+        assert third.state == "done"
+        assert third.result == "All steps finished."
+
+        # The original trace stays intact with its saved tool results.
+        original_status, history = restarted.read_session(task_id, ctx.session_key)
+        assert original_status.state == "incomplete"
+        original_tools = [m["content"] for m in history.messages if m.get("role") == "tool"]
+        assert any("evidence" in result for result in original_tools)
+    finally:
+        if not manager_closed:
+            await manager.close()
+        if restarted is not None:
+            await restarted.close()
 
 
 @pytest.mark.asyncio
@@ -591,6 +798,33 @@ async def test_empty_final_response_is_a_failure(tmp_path):
     assert "completed successfully" not in notice.content
     assert notice.metadata["subagent_state"] == "error"
     await manager.close()
+
+
+@pytest.mark.asyncio
+async def test_follow_up_points_to_send_only_while_task_accepts_messages(tmp_path):
+    manager, provider, ctx = setup(tmp_path, session_manager=SessionManager(tmp_path))
+    release = asyncio.Event()
+
+    async def chat(**_kwargs):
+        await release.wait()
+        return LLMResponse(content="")
+
+    provider.chat_stream_with_retry = AsyncMock(side_effect=chat)
+    try:
+        task_id = await spawn(manager, ctx)
+        with request_context(ctx):
+            tool = SubagentTool(manager)
+            active = await tool.execute("follow_up", task_id=task_id, message="Any updates?")
+            assert is_tool_error_result(active)
+            assert "use send" in active
+            release.set()
+            await asyncio.wait_for(settled(manager), timeout=2)
+            failed = await tool.execute("follow_up", task_id=task_id, message="Any updates?")
+            assert is_tool_error_result(failed)
+            assert "current state: error" in failed
+            assert "use send" not in failed
+    finally:
+        await manager.close()
 
 
 @pytest.mark.asyncio
@@ -1042,7 +1276,7 @@ async def test_cleanup_wait_is_bounded_and_repeated_cancel_does_not_interrupt_it
 def test_subagent_schema_exposes_task_actions(tmp_path):
     manager, _, _ = setup(tmp_path)
     properties = SubagentTool(manager).parameters["properties"]
-    assert properties["action"]["enum"] == ["create", "send", "cancel", "check"]
+    assert properties["action"]["enum"] == ["create", "follow_up", "send", "cancel", "check"]
     assert "owner" not in properties
     tool = SubagentTool(manager)
     assert tool.validate_params({"action": "create", "task": "review"}) == []
