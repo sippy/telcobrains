@@ -87,6 +87,7 @@ class CommandRouter:
         self._exact: dict[str, Handler] = {}
         self._prefix: list[tuple[str, Handler]] = []
         self._session_commands: set[str] = set()
+        self._session_prefixes: set[str] = set()
         self._specs: list[BuiltinCommandSpec] = []
 
     @property
@@ -116,17 +117,21 @@ class CommandRouter:
         else:
             self._session_commands.discard(cmd)
 
-    def prefix(self, pfx: str, handler: Handler) -> None:
+    def prefix(self, pfx: str, handler: Handler, *, session_queue: bool = False) -> None:
         self._prefix.append((pfx, handler))
         self._prefix.sort(key=lambda p: len(p[0]), reverse=True)
+        if session_queue:
+            self._session_prefixes.add(pfx.lower())
 
     def is_priority(self, text: str) -> bool:
         return normalize_command_text(text).lower() in self._priority
 
     def requires_session_queue(self, text: str) -> bool:
-        """Whether an exact command must run on the session worker."""
+        """Whether a command must run on the session worker."""
         cmd = normalize_command_text(text).lower()
-        return cmd in self._session_commands and cmd not in self._priority
+        if cmd in self._session_commands and cmd not in self._priority:
+            return True
+        return any(cmd.startswith(pfx) for pfx in self._session_prefixes)
 
     def command_name(self, text: str) -> str | None:
         """Return the registered command name, or None for ordinary chat text.

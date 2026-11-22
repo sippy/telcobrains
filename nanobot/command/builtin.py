@@ -12,6 +12,7 @@ from uuid import uuid4
 from loguru import logger
 
 from nanobot import __version__
+from nanobot.agent.memory import CompactionPreview
 from nanobot.bus.events import InboundMessage, OutboundMessage
 from nanobot.bus.outbound_events import SideChannelReplyEvent
 from nanobot.command.router import CommandContext, CommandRouter
@@ -47,6 +48,8 @@ CORE_COMMAND_SPECS: tuple[BuiltinCommandSpec, ...] = (
         "Compact context",
         "Compact this chat's context and continue the conversation.",
         "archive",
+        "[--dry-run]",
+        accepts_args=True,
     ),
     BuiltinCommandSpec(
         "/stop",
@@ -272,6 +275,20 @@ async def cmd_new(ctx: CommandContext) -> OutboundMessage:
 async def cmd_compact(ctx: CommandContext) -> OutboundMessage | None:
     """Compact the current session without resetting the conversation."""
     loop = ctx.loop
+    args = ctx.args.strip()
+    tokens = args.split()
+    if tokens:
+        if tokens[0].lower() != "--dry-run" or len(tokens) > 1:
+            return OutboundMessage(
+                channel=ctx.msg.channel, chat_id=ctx.msg.chat_id,
+                content=(
+                    "Usage: /compact [--dry-run]\n\n"
+                    "`/compact` compacts now; `/compact --dry-run` test-runs the real "
+                    "compactor once and discards the result without changing the chat."
+                ),
+                metadata={**dict(ctx.msg.metadata or {}), "render_as": "text"},
+            )
+        return await _compact_dry_run(ctx)
     session = ctx.session or await loop.sessions.state.get(ctx.key)
     # Explicit session compaction uses the shared compaction runtime, so a
     # configured compactor preset routes manual compaction the same way as
@@ -307,6 +324,160 @@ async def cmd_compact(ctx: CommandContext) -> OutboundMessage | None:
         channel=ctx.msg.channel, chat_id=ctx.msg.chat_id, content=content,
         metadata=dict(ctx.msg.metadata or {}),
     )
+
+
+async def _compact_dry_run(ctx: CommandContext) -> OutboundMessage:
+    """Test-run the real compactor once and report the outcome without applying it."""
+    loop = ctx.loop
+    metadata = {**dict(ctx.msg.metadata or {}), "render_as": "text"}
+    session = ctx.session or await loop.sessions.state.get(ctx.key)
+    try:
+        # One read-only runtime capture: re-resolving a removed session preset
+        # would write session metadata, which a dry run must not do.
+        foreground = (
+            ctx.runtime
+            if ctx.runtime is not None
+            else await loop.runtime_for_session(session, recover_removed=False)
+        )
+        runtime, tools, no_tool_contract, replay_config = await loop.compaction_runtime_for_session(
+            session, replay_runtime=foreground,
+        )
+        preview = await loop.consolidator.compact_idle_session_dry_run(
+            ctx.key,
+            runtime=runtime,
+            replay_runtime=foreground,
+            tools=tools,
+            no_tool_contract=no_tool_contract,
+            replay_config=replay_config,
+        )
+    except (KeyError, ValueError):
+        return OutboundMessage(
+            channel=ctx.msg.channel, chat_id=ctx.msg.chat_id,
+            content=(
+                "Compaction dry run could not resolve this session's model preset "
+                "(it may reference a removed preset); nothing was changed. "
+                "Run `/model` to repair the selection, then retry."
+            ),
+            metadata=metadata,
+        )
+    except Exception:
+        logger.exception("Compaction dry run failed for {}", ctx.key)
+        return OutboundMessage(
+            channel=ctx.msg.channel, chat_id=ctx.msg.chat_id,
+            content="Compaction dry run failed; nothing was changed.",
+            metadata=metadata,
+        )
+    return OutboundMessage(
+        channel=ctx.msg.channel, chat_id=ctx.msg.chat_id,
+        content=_format_compact_dry_run(preview),
+        metadata=metadata,
+    )
+
+
+def _format_compact_dry_run(preview: CompactionPreview) -> str:
+    lines = ["## Compaction dry run", ""]
+    if preview.provider_calls > 0:
+        lines.append(
+            "The compactor ran the real compaction once and the result was discarded: the "
+            "conversation, checkpoints, saved history, and provider state are unchanged. "
+            "Provider inference (and its cost) was incurred."
+        )
+    else:
+        lines.append(
+            "No summarizer call was made: the conversation, checkpoints, saved history, "
+            "and provider state are unchanged."
+        )
+    lines.append(
+        "Only this dry run's own command reply is stored, like any command exchange, "
+        "which may refresh the session's idle-compaction clock."
+    )
+    lines.append("")
+    if preview.outcome == "no_history":
+        lines.append("- Outcome: no history to compact.")
+        return "\n".join(lines)
+    if preview.outcome == "skipped":
+        lines.append(f"- Outcome: skipped — {preview.reason}")
+        lines.append(f"- Model that would summarize: `{preview.model}`")
+        lines.append(
+            f"- Before (estimate): {preview.unarchived_count} replayable message(s), "
+            f"~{preview.estimated_prompt_tokens} prompt tokens"
+        )
+        return "\n".join(lines)
+
+    if preview.outcome == "summarized":
+        lines.append("- Outcome: summary generated by the compactor (discarded)")
+    elif preview.outcome == "raw_fallback":
+        if preview.provider_calls:
+            lines.append(
+                "- Outcome: raw fallback checkpoint — the summarizer call produced no usable "
+                "output; a real /compact would store a bounded raw dump instead"
+            )
+        else:
+            lines.append(
+                "- Outcome: raw fallback checkpoint — the summarizer could not be asked "
+                "about this transcript (no provider call was made); a real /compact "
+                "would store a bounded raw dump instead"
+            )
+    else:
+        lines.append(f"- Outcome: error — {preview.reason}")
+        lines.append("- No changes were made.")
+        if preview.provider_calls:
+            lines.append(f"- Provider calls: {preview.provider_calls}")
+        return "\n".join(lines)
+
+    lines.append(f"- Model: `{preview.model}`")
+    lines.append(f"- Elapsed: {preview.elapsed_s:.1f}s")
+    usage = preview.usage
+    if usage is not None:
+        if usage.generation_ms > 0 and usage.measured_output_tokens > 0:
+            throughput = usage.measured_output_tokens / (usage.generation_ms / 1000)
+            lines.append(
+                f"- Throughput (estimate): {throughput:.1f} output tokens/s over the "
+                "measured streaming generation time (excludes first token and retries)"
+            )
+        elif usage.output_tokens > 0 and preview.elapsed_s > 0:
+            lines.append(
+                f"- Throughput (estimate): {usage.output_tokens / preview.elapsed_s:.1f} "
+                "output tokens/s over wall-clock elapsed time"
+            )
+        source = {"reported": "provider-reported", "estimated": "locally estimated", "mixed": "provider-reported plus locally estimated"}[usage.source]
+        lines.append(
+            f"- Provider usage: {usage.input_tokens} input / {usage.output_tokens} output tokens "
+            f"({source}; {preview.provider_calls} summarizer call(s))"
+        )
+    elif preview.provider_calls:
+        lines.append(f"- Provider calls: {preview.provider_calls} (usage not reported by the provider)")
+    lines.append(
+        f"- Before (estimate): {preview.unarchived_count} replayable message(s), "
+        f"~{preview.estimated_prompt_tokens} prompt tokens"
+    )
+    checkpoint_wording = (
+        "replaced by one raw-dump checkpoint"
+        if preview.outcome == "raw_fallback"
+        else "summarized into one checkpoint"
+    )
+    if preview.retained_count > 0:
+        lines.append(f"- Protected prefix: {preview.archived_count} message(s) {checkpoint_wording}")
+        lines.append(f"- Retained tail: {preview.retained_count} message(s) kept verbatim")
+    elif preview.archived_count == preview.unarchived_count:
+        lines.append(f"- Full unarchived prefix: {preview.archived_count} message(s) {checkpoint_wording}")
+    else:
+        lines.append(
+            f"- Archive range: {preview.archived_count} message(s) "
+            f"({preview.unarchived_count} replayable), {checkpoint_wording}"
+        )
+    if preview.summary is not None:
+        lines.append(
+            f"- Generated checkpoint: {len(preview.summary)} chars, ~{preview.estimated_summary_tokens} tokens "
+            "(estimate; discarded, not persisted)"
+        )
+    if preview.estimated_prompt_tokens_after > 0:
+        lines.append(
+            f"- After, if applied (estimate): ~{preview.estimated_prompt_tokens_after} prompt tokens"
+        )
+    lines.append("")
+    lines.append("Run `/compact` without `--dry-run` to apply the compaction.")
+    return "\n".join(lines)
 
 
 def _format_preset_names(names: list[str]) -> str:
@@ -838,6 +1009,7 @@ def register_core_commands(router: CommandRouter) -> None:
     router.priority("/status", cmd_status)
     router.exact("/new", cmd_new)
     router.exact("/compact", cmd_compact, session_queue=True)
+    router.prefix("/compact ", cmd_compact, session_queue=True)
     router.exact("/status", cmd_status)
     router.exact("/model", cmd_model)
     router.prefix("/model ", cmd_model)

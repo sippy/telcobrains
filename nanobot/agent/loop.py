@@ -298,11 +298,14 @@ class AgentLoop:
         return compactor, resumable, False
 
     async def compaction_runtime_for_session(
-        self, session: Session,
+        self, session: Session, *, replay_runtime: LLMRuntime | None = None,
     ) -> tuple[LLMRuntime, list[dict[str, Any]], bool, ContextGovernanceConfig]:
         """Resolve compactor routing and the foreground replay budget.
 
-        Returns the compaction runtime, the tool set offered to the
+        ``replay_runtime`` reuses an already captured session runtime instead
+        of re-resolving it, so read-only callers (e.g. the compaction dry run)
+        avoid the recovery write that re-resolving a removed preset would
+        perform. Returns the compaction runtime, the tool set offered to the
         summarizer (the session tool registry by default, or ``[]`` when a
         configured compactor performs the summarization), and whether the
         request carries the explicit no-tools contract. The contract belongs
@@ -315,7 +318,11 @@ class AgentLoop:
         recent verbatim history the compaction must keep (below which session
         compaction skips instead of shrinking).
         """
-        foreground = await self.runtime_for_session(session)
+        foreground = (
+            replay_runtime
+            if replay_runtime is not None
+            else await self.runtime_for_session(session)
+        )
         runtime, _resumable, offers_tools = self.select_compaction_runtime(foreground)
         tools = self.tools.get_definitions() if offers_tools else []
         replay_config = ContextGovernanceConfig(

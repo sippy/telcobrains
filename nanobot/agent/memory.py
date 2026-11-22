@@ -9,11 +9,14 @@ import asyncio
 import json
 import re
 import threading
+import time
 import weakref
 from contextlib import suppress
+from dataclasses import dataclass
+from dataclasses import replace as dataclasses_replace
 from datetime import datetime
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Callable, Iterator, cast
+from typing import TYPE_CHECKING, Any, Callable, Iterator, Literal, cast
 from uuid import uuid4
 
 from loguru import logger
@@ -22,6 +25,7 @@ from nanobot.agent.context_governance import ContextGovernanceConfig, ContextGov
 from nanobot.config.paths import DREAM_CURSOR_PATH, MEMORY_CURSOR_PATH, MEMORY_JOURNAL_PATH
 from nanobot.events import NO_EVENTS, CompactionReason, ContextCompactionEvent, EventSink
 from nanobot.llm_usage.context import llm_usage_source
+from nanobot.llm_usage.types import LLMUsage
 from nanobot.providers.base import LLMResponse, ProviderConversationState
 from nanobot.providers.conversation_state import ProviderConversationStateController
 from nanobot.runtime_context import public_history_messages
@@ -753,7 +757,10 @@ class MemoryArchiver:
         previous_summary: str | None,
         max_tokens: int,
         persist: bool = True,
+        telemetry: CompactionCallTelemetry | None = None,
     ) -> str:
+        if telemetry is not None:
+            telemetry.raw_fallback = True
         raw = (
             self.store.raw_archive(messages, session_key=session_key)
             if persist
@@ -811,6 +818,7 @@ class MemoryArchiver:
         provider_state: ProviderConversationState | None = None,
         no_tool_contract: bool = False,
         persist: bool = True,
+        telemetry: CompactionCallTelemetry | None = None,
     ) -> str | None:
         """Generate a replacement checkpoint and optionally persist it.
 
@@ -835,6 +843,7 @@ class MemoryArchiver:
                     else runtime.generation.max_tokens
                 ),
                 persist=persist,
+                telemetry=telemetry,
             )
 
         prompt_message = _archive_prompt(len(source_messages))
@@ -914,7 +923,17 @@ class MemoryArchiver:
                     "Memory archive {} failed; using raw checkpoint",
                     phase,
                 )
+                if telemetry is not None:
+                    telemetry.provider_calls += 1
                 return raw_fallback()
+            if telemetry is not None:
+                telemetry.provider_calls += 1
+                if response.usage is not None:
+                    telemetry.usage = (
+                        response.usage
+                        if telemetry.usage is None
+                        else telemetry.usage + response.usage
+                    )
             if response.should_execute_tools is not True or attempt == 1 or not request_tools:
                 # Tool-free requests (a configured compactor, or a session
                 # without tools) never recover: echoing an unsolicited
@@ -997,13 +1016,16 @@ class MemoryArchiver:
         input_token_budget: int,
         tools: list[dict[str, Any]] | None = None,
         no_tool_contract: bool = False,
+        persist: bool = True,
+        telemetry: CompactionCallTelemetry | None = None,
     ) -> str | None:
         """Archive a captured session prefix without mutating the session.
 
         ``tools`` is the tool set offered with the summarization request.
         ``None`` keeps the legacy registry defaults; a configured compactor
         passes ``[]`` (with ``no_tool_contract``) so the request offers no
-        tool calls at all.
+        tool calls at all. ``persist`` controls the history journal exactly
+        as in :meth:`archive`, so dry runs can discard their result.
         """
         messages = [
             message for message in session.messages[session.last_archived:archive_end]
@@ -1027,6 +1049,8 @@ class MemoryArchiver:
                 session_key=session.key,
                 previous_summary=previous_summary,
                 max_tokens=runtime.generation.max_tokens,
+                persist=persist,
+                telemetry=telemetry,
             )
         prefix = Session(
             key=session.key,
@@ -1048,6 +1072,8 @@ class MemoryArchiver:
                 session_key=session.key,
                 previous_summary=previous_summary,
                 max_tokens=runtime.generation.max_tokens,
+                persist=persist,
+                telemetry=telemetry,
             )
         channel = session.key.split(":", 1)[0] if ":" in session.key else None
         workspace: Path | None = None
@@ -1070,7 +1096,63 @@ class MemoryArchiver:
             previous_summary=previous_summary,
             input_token_budget=input_token_budget,
             no_tool_contract=no_tool_contract,
+            persist=persist,
+            telemetry=telemetry,
         )
+
+
+@dataclass
+class CompactionCallTelemetry:
+    """Measure the summarizer calls behind one compaction attempt.
+
+    Filled in by :meth:`MemoryArchiver.archive` so a dry-run preview can
+    report provider usage and distinguish an LLM summary from a locally
+    built raw checkpoint.
+    """
+
+    provider_calls: int = 0
+    usage: LLMUsage | None = None
+    raw_fallback: bool = False
+
+
+@dataclass
+class CompactionPlan:
+    """Archive boundary chosen for one session compaction attempt.
+
+    ``prefix`` is ``None`` on the legacy full-prefix path, where the whole
+    raw unarchived suffix is archived. ``skipped`` marks the verbatim-tail
+    no-op that session compaction reports instead of archiving; in that case
+    ``skip_no_capacity`` says whether the compactor's budget could not be
+    derived at all.
+    """
+
+    session: Session
+    previous_summary: str | None
+    archive_start: int
+    archive_end: int
+    prefix: list[dict[str, Any]] | None = None
+    unarchived_count: int = 0
+    skipped: bool = False
+    skip_no_capacity: bool = False
+
+
+@dataclass
+class CompactionPreview:
+    """Outcome of one dry-run compaction whose checkpoint was discarded."""
+
+    outcome: Literal["no_history", "skipped", "summarized", "raw_fallback", "error"] = "no_history"
+    reason: str | None = None
+    model: str = ""
+    summary: str | None = None
+    elapsed_s: float = 0.0
+    usage: LLMUsage | None = None
+    provider_calls: int = 0
+    unarchived_count: int = 0
+    archived_count: int = 0
+    retained_count: int = 0
+    estimated_prompt_tokens: int = 0
+    estimated_summary_tokens: int = 0
+    estimated_prompt_tokens_after: int = 0
 
 
 def min_tail_skip_marker(
@@ -1169,6 +1251,7 @@ class Consolidator:
         provider_state: ProviderConversationState | None = None,
         no_tool_contract: bool = False,
         persist: bool = True,
+        telemetry: CompactionCallTelemetry | None = None,
     ) -> str | None:
         """Summarize the exact transcript prefix already accepted by the model."""
         source_messages = [
@@ -1198,6 +1281,7 @@ class Consolidator:
             provider_state=provider_state,
             no_tool_contract=no_tool_contract,
             persist=persist,
+            telemetry=telemetry,
         )
         if summary is None:
             return None
@@ -1275,6 +1359,8 @@ class Consolidator:
         runtime: LLMRuntime,
         tools: list[dict[str, Any]] | None = None,
         no_tool_contract: bool = False,
+        persist: bool = True,
+        telemetry: CompactionCallTelemetry | None = None,
     ) -> str | None:
         """Archive one captured session range through the shared Memory path."""
         return await self.archiver.archive_session(
@@ -1284,6 +1370,8 @@ class Consolidator:
             input_token_budget=self._input_token_budget(runtime),
             tools=tools,
             no_tool_contract=no_tool_contract,
+            persist=persist,
+            telemetry=telemetry,
         )
 
     def _session_prefix_cut(
@@ -1336,6 +1424,92 @@ class Consolidator:
                 return None
         return archive_end, prefix
 
+    async def plan_idle_compaction(
+        self,
+        session: Session,
+        *,
+        runtime: LLMRuntime,
+        tools: list[dict[str, Any]] | None = None,
+        replay_config: ContextGovernanceConfig | None = None,
+    ) -> CompactionPlan | None:
+        """Choose the exact archive boundary for one session compaction attempt.
+
+        Shared by :meth:`compact_idle_session` and its dry run so both pick
+        identical boundaries, compactor budgets, and summarizer requests.
+        Returns ``None`` when there is no replayable activity to archive.
+        """
+        archive_start = session.last_archived
+        messages_to_archive = list(session.messages[archive_start:])
+        if not any(
+            not message.get("_command") and not is_summary_checkpoint(message)
+            for message in messages_to_archive
+        ):
+            return None
+        stored_summary = session_summary_from_metadata(
+            session.metadata, fallback_last_active=session.updated_at,
+        )
+        previous_summary = stored_summary["text"] if stored_summary else None
+        budget = (
+            self.compactor_input_budget(runtime, tools, len(messages_to_archive))
+            if replay_config is not None else None
+        )
+        cut = (
+            await self._context_governor.prepare_in_background(
+                self._session_prefix_cut, session, replay_config, budget,
+                previous_summary, runtime, tools,
+            )
+            if replay_config is not None and budget is not None else None
+        )
+        skipped = (
+            replay_config is not None
+            and replay_config.min_verbatim_tail_tokens > 0
+            and cut is None
+        )
+        if cut is None:
+            archive_end = archive_start + len(messages_to_archive)
+            prefix = None
+        else:
+            archive_end, prefix = cut
+        unarchived_count = sum(
+            1 for message in messages_to_archive
+            if not message.get("_command") and not is_summary_checkpoint(message)
+        )
+        return CompactionPlan(
+            session=session,
+            previous_summary=previous_summary,
+            archive_start=archive_start,
+            archive_end=archive_end,
+            prefix=prefix,
+            unarchived_count=unarchived_count,
+            skipped=skipped,
+            skip_no_capacity=skipped and budget is None,
+        )
+
+    async def _execute_compaction(
+        self,
+        plan: CompactionPlan,
+        *,
+        runtime: LLMRuntime,
+        session_key: str,
+        tools: list[dict[str, Any]] | None = None,
+        no_tool_contract: bool = False,
+        persist: bool = True,
+        telemetry: CompactionCallTelemetry | None = None,
+    ) -> str | None:
+        """Run the summarizer for a planned compaction at the plan's exact boundary."""
+        if plan.prefix is not None:
+            return await self.summarize_transcript(
+                plan.prefix, plan.previous_summary, runtime=runtime, session_key=session_key,
+                tools=self._get_tool_definitions() if tools is None else tools,
+                no_tool_contract=no_tool_contract,
+                persist=persist, telemetry=telemetry,
+            )
+        return await self.archive_session(
+            plan.session, archive_end=plan.archive_end, runtime=runtime, tools=tools,
+            no_tool_contract=no_tool_contract,
+            persist=persist, telemetry=telemetry,
+        )
+
     async def compact_idle_session(
         self,
         session_key: str,
@@ -1362,19 +1536,6 @@ class Consolidator:
             await self.sessions.state.discard(session_key)
             session = await self.sessions.state.get(session_key)
 
-            stored_summary = session_summary_from_metadata(
-                session.metadata, fallback_last_active=session.updated_at,
-            )
-            previous_summary = stored_summary["text"] if stored_summary else None
-            archive_start = session.last_archived
-            messages_to_archive = list(session.messages[archive_start:])
-            has_new_messages = any(
-                not message.get("_command") and not is_summary_checkpoint(message)
-                for message in messages_to_archive
-            )
-            if not has_new_messages:
-                return ""
-
             # Read-only sizing before announcing: resolve the compactor budget and
             # the protected-tail cut so a floor no-op needs no lifecycle events.
             # If sizing fails or is cancelled, emit the lifecycle pair before
@@ -1384,15 +1545,8 @@ class Consolidator:
                 compaction_id=compaction_id, phase="started", notify=notify, reason=reason,
             )
             try:
-                budget = (
-                    self.compactor_input_budget(runtime, tools, len(messages_to_archive))
-                    if replay_config is not None else None
-                )
-                cut = (
-                    await self._context_governor.prepare_in_background(
-                        self._session_prefix_cut, session, replay_config, budget, previous_summary, runtime, tools,
-                    )
-                    if replay_config is not None and budget is not None else None
+                plan = await self.plan_idle_compaction(
+                    session, runtime=runtime, tools=tools, replay_config=replay_config,
                 )
             except (Exception, asyncio.CancelledError) as exc:
                 await events.emit(started)
@@ -1406,7 +1560,9 @@ class Consolidator:
                 )
                 raise
 
-            if replay_config is not None and replay_config.min_verbatim_tail_tokens > 0 and cut is None:
+            if plan is None:
+                return ""
+            if plan.skipped:
                 # A normal no-op, not a failure or a full-prefix archive.
                 # Remember it for idle scans only while the history and sizing policy match.
                 marker = min_tail_skip_marker(session, runtime, replay_config)
@@ -1424,23 +1580,14 @@ class Consolidator:
                 return ""
 
             await events.emit(started)
-            archive_end = archive_start + len(messages_to_archive)
             try:
-                if cut is None:
-                    summary = await self.archive_session(
-                        session, archive_end=archive_end, runtime=runtime, tools=tools,
-                        no_tool_contract=no_tool_contract,
-                    )
-                else:
-                    archive_end, prefix = cut
-                    summary = await self.summarize_transcript(
-                        prefix, previous_summary, runtime=runtime, session_key=session_key,
-                        tools=self._get_tool_definitions() if tools is None else tools,
-                        no_tool_contract=no_tool_contract,
-                    )
+                summary = await self._execute_compaction(
+                    plan, runtime=runtime, session_key=session_key, tools=tools,
+                    no_tool_contract=no_tool_contract,
+                )
                 if summary:
                     await self.sessions.state.commit_summary(
-                        session, summary, archive_end=archive_end,
+                        session, summary, archive_end=plan.archive_end,
                     )
             except (Exception, asyncio.CancelledError) as exc:
                 await events.emit(
@@ -1470,10 +1617,104 @@ class Consolidator:
             logger.info(
                 "Session compact for {}: archived={}, replay_tail={}, retained={}, summary={}",
                 session_key,
-                archive_end - archive_start,
-                len(session.messages) - archive_end,
+                plan.archive_end - plan.archive_start,
+                len(session.messages) - plan.archive_end,
                 len(session.messages),
                 bool(summary),
             )
 
             return summary
+
+    async def compact_idle_session_dry_run(
+        self,
+        session_key: str,
+        *,
+        runtime: LLMRuntime,
+        replay_runtime: LLMRuntime,
+        tools: list[dict[str, Any]] | None = None,
+        no_tool_contract: bool = False,
+        replay_config: ContextGovernanceConfig | None = None,
+    ) -> CompactionPreview:
+        """Run one real compaction attempt and discard its result.
+
+        Shares :meth:`plan_idle_compaction` and :meth:`_execute_compaction`
+        with :meth:`compact_idle_session`, so it runs the same preflight and
+        the exact same summarizer request; the configured compactor is called
+        for real, so provider inference and its cost can occur. The only
+        differences are the publication effects: no summary commit,
+        history-journal entry, skip marker, or lifecycle event, and no
+        session metadata. Token figures are estimates.
+        """
+        preview = CompactionPreview(model=runtime.model)
+        lock = self.get_lock(session_key)
+        async with lock:
+            session = await self.sessions.state.get(session_key)
+            try:
+                plan = await self.plan_idle_compaction(
+                    session, runtime=runtime, tools=tools, replay_config=replay_config,
+                )
+            except Exception as exc:
+                logger.exception("Compaction dry-run sizing failed for {}", session_key)
+                preview.outcome = "error"
+                preview.reason = type(exc).__name__
+                return preview
+            if plan is None:
+                preview.outcome = "no_history"
+                return preview
+            preview.unarchived_count = plan.unarchived_count
+            preview.estimated_prompt_tokens, _ = self.estimate_session_prompt_tokens(
+                session, runtime=replay_runtime,
+            )
+            if plan.skipped:
+                preview.outcome = "skipped"
+                preview.reason = (
+                    "the compactor's input capacity cannot be derived for the verbatim-tail policy"
+                    if plan.skip_no_capacity else
+                    f"no compaction fit while keeping the configured minimum of "
+                    f"{replay_config.min_verbatim_tail_tokens} verbatim tail tokens"
+                )
+                return preview
+
+            preview.archived_count = plan.archive_end - plan.archive_start
+            preview.retained_count = len(session.messages) - plan.archive_end
+
+            telemetry = CompactionCallTelemetry()
+            started = time.monotonic()
+            try:
+                summary = await self._execute_compaction(
+                    plan, runtime=runtime, session_key=session_key, tools=tools,
+                    no_tool_contract=no_tool_contract,
+                    persist=False, telemetry=telemetry,
+                )
+            except Exception as exc:
+                logger.exception("Compaction dry run failed for {}", session_key)
+                preview.outcome = "error"
+                preview.reason = type(exc).__name__
+                preview.elapsed_s = time.monotonic() - started
+                preview.usage = telemetry.usage
+                preview.provider_calls = telemetry.provider_calls
+                return preview
+            preview.elapsed_s = time.monotonic() - started
+            preview.usage = telemetry.usage
+            preview.provider_calls = telemetry.provider_calls
+            if not summary:
+                preview.outcome = "error"
+                preview.reason = "the compactor produced no checkpoint"
+                return preview
+
+            preview.summary = summary
+            preview.outcome = "raw_fallback" if telemetry.raw_fallback else "summarized"
+            preview.estimated_summary_tokens, _ = estimate_prompt_tokens_chain(
+                replay_runtime.provider, replay_runtime.model,
+                [{"role": "user", "content": summary}], None,
+            )
+            # Project the post-compaction replay on a throwaway copy, exactly as
+            # commit_summary_checkpoint would; nothing is written for it.
+            projected = dataclasses_replace(
+                session, messages=list(session.messages), metadata=dict(session.metadata),
+            )
+            projected.commit_summary_checkpoint(summary, insert_at=plan.archive_end)
+            preview.estimated_prompt_tokens_after, _ = self.estimate_session_prompt_tokens(
+                projected, runtime=replay_runtime,
+            )
+            return preview
