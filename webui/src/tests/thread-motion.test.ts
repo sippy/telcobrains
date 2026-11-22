@@ -159,8 +159,8 @@ describe("ThreadMotionCoordinator", () => {
     },
   );
 
-  it("does not resume streaming follow when the reader reaches the tail", () => {
-    const { camera, coordinator, onAutoFollow, advanceFrame, setGeometry, settleCamera } = motionHarness();
+  it("resumes live-tail follow when the reader returns to the tail", () => {
+    const { camera, coordinator, advanceFrame, setGeometry, settleCamera } = motionHarness();
     coordinator.updateTurn("turn-1");
     coordinator.anchorSubmittedPrompt("prompt-1");
     advanceFrame();
@@ -168,15 +168,86 @@ describe("ThreadMotionCoordinator", () => {
     coordinator.handleUserScrollIntent(true);
     coordinator.handleUserScrollIntent(true, true);
     expect(coordinator.observeScroll(true)).toBe("automatic");
-    expect(onAutoFollow).toHaveBeenCalledTimes(1);
-    expect(coordinator.snapshot().mode).toBe("idle");
-    camera.jumpTo.mockClear();
-    camera.navigateTo.mockClear();
+    expect(coordinator.snapshot().mode).toBe("follow-latest");
     setGeometry({ scrollHeight: 2_400 });
     coordinator.invalidateGeometry();
     advanceFrame();
+    expect(camera.jumpTo).toHaveBeenCalledWith(1_900);
+  });
+
+  it("engages follow when the reader presses down at the live tail", () => {
+    const { camera, coordinator, advanceFrame, setGeometry, settleCamera } = motionHarness();
+    coordinator.updateTurn("turn-1");
+    coordinator.anchorSubmittedPrompt("prompt-1");
+    advanceFrame();
+    settleCamera();
+    coordinator.handleUserScrollIntent(true, false);
+    expect(coordinator.snapshot().mode).toBe("browsing-history");
+    coordinator.handleUserScrollIntent(false, true);
+    expect(coordinator.snapshot().mode).toBe("follow-latest");
+    setGeometry({ scrollHeight: 2_400 });
+    coordinator.reconcileObservedGeometry();
+    expect(camera.jumpTo).toHaveBeenCalledWith(1_900);
+  });
+
+  it("keeps programmatic resume non-following while a turn is running", () => {
+    const { camera, coordinator, advanceFrame, setGeometry } = motionHarness();
+    coordinator.updateTurn("turn-1");
+    coordinator.resumeAutoFollow();
+    advanceFrame();
     expect(camera.jumpTo).not.toHaveBeenCalled();
-    expect(camera.navigateTo).not.toHaveBeenCalled();
+    expect(coordinator.snapshot().mode).toBe("idle");
+    setGeometry({ scrollHeight: 2_000 });
+    coordinator.invalidateGeometry();
+    advanceFrame();
+    expect(camera.jumpTo).not.toHaveBeenCalled();
+    expect(coordinator.snapshot().mode).toBe("idle");
+  });
+
+  it("engages follow when a prompt navigation settles at the live tail", () => {
+    const { camera, coordinator, advanceFrame, setCameraFollowing, setGeometry } =
+      motionHarness({ promptTop: 1_400, scrollTop: 1_400 });
+    coordinator.updateTurn("turn-1");
+    coordinator.setLiveWindow(true);
+    coordinator.navigateHistoryToPrompt("prompt-9");
+    setCameraFollowing(false);
+    expect(coordinator.observeScroll(true)).toBe("navigation");
+    expect(coordinator.snapshot().mode).toBe("follow-latest");
+    setGeometry({ scrollTop: 1_400, scrollHeight: 2_400 });
+    coordinator.invalidateGeometry();
+    advanceFrame();
+    expect(camera.jumpTo).toHaveBeenCalledWith(1_900);
+  });
+
+  it("settles an instant live-tail prompt jump into follow without a scroll event", () => {
+    const { camera, coordinator, advanceFrame, setGeometry, setNextNavigationResult } =
+      motionHarness({ promptTop: 1_400, scrollTop: 1_400 });
+    coordinator.updateTurn("turn-1");
+    coordinator.setLiveWindow(true);
+    // Reduced motion or an already-visible destination settles the camera
+    // before any scroll event or retarget can carry the settle.
+    setNextNavigationResult("settled");
+    expect(coordinator.navigateHistoryToPrompt("prompt-9")).toBe("settled");
+    expect(coordinator.snapshot().mode).toBe("follow-latest");
+    setGeometry({ scrollHeight: 2_400 });
+    coordinator.invalidateGeometry();
+    advanceFrame();
+    expect(camera.jumpTo).toHaveBeenCalledWith(1_900);
+  });
+
+  it("keeps a prompt navigation out of follow when it settles away from the tail", () => {
+    const { camera, coordinator, advanceFrame, setCameraFollowing, setGeometry } =
+      motionHarness({ promptTop: 300 });
+    coordinator.updateTurn("turn-1");
+    coordinator.setLiveWindow(true);
+    coordinator.navigateHistoryToPrompt("prompt-2");
+    setCameraFollowing(false);
+    expect(coordinator.observeScroll(false)).toBe("navigation");
+    expect(coordinator.snapshot().mode).toBe("browsing-history");
+    setGeometry({ scrollTop: 300, scrollHeight: 2_400 });
+    coordinator.invalidateGeometry();
+    advanceFrame();
+    expect(camera.jumpTo).not.toHaveBeenCalled();
   });
 
   it("stops idle tail following when a running turn is restored", () => {
@@ -241,7 +312,7 @@ describe("ThreadMotionCoordinator", () => {
     expect(camera.jumpTo).not.toHaveBeenCalled();
   });
 
-  it("retargets explicit latest navigation while moving, then stops following", () => {
+  it("retargets explicit latest navigation while moving, then keeps following the live tail", () => {
     const { camera, coordinator, advanceFrame, setCameraFollowing, setGeometry } = motionHarness();
     coordinator.updateTurn("turn-1");
     coordinator.anchorSubmittedPrompt("prompt-1");
@@ -255,12 +326,11 @@ describe("ThreadMotionCoordinator", () => {
     expect(camera.navigateTo.mock.calls).toEqual([[1_400], [1_600]]);
     setCameraFollowing(false);
     expect(coordinator.observeScroll(true)).toBe("navigation");
-    expect(coordinator.snapshot().mode).toBe("idle");
-    camera.jumpTo.mockClear();
+    expect(coordinator.snapshot().mode).toBe("follow-latest");
     setGeometry({ scrollTop: 1_600, scrollHeight: 2_300 });
     coordinator.invalidateGeometry();
     advanceFrame();
-    expect(camera.jumpTo).not.toHaveBeenCalled();
+    expect(camera.jumpTo).toHaveBeenCalledWith(1_800);
   });
 
   it("keeps history navigation in control through turn completion", () => {
@@ -327,7 +397,7 @@ describe("ThreadMotionCoordinator", () => {
 
     coordinator.navigateHistoryToPrompt("prompt-1");
     coordinator.cameraSettled();
-    expect(coordinator.snapshot().mode).toBe("navigating-history");
+    expect(coordinator.snapshot().mode).toBe("browsing-history");
   });
 
   it("keeps explicit latest navigation in control when already following the tail", () => {

@@ -22,6 +22,7 @@ import { isActivityWindowMember } from "@/lib/activity-timeline";
 import { ThreadCameraController } from "@/components/thread/thread-camera";
 import { HISTORY_HOLD_PX, ThreadHistorySpring, type HistoryRevealPhase } from "@/components/thread/thread-history-spring";
 import {
+  NEAR_BOTTOM_PX,
   ThreadMotionCoordinator,
   type ThreadMotionGeometry,
 } from "@/components/thread/thread-motion";
@@ -79,7 +80,6 @@ interface ThreadViewportProps {
   onQuoteSelection?: (text: string) => void;
 }
 
-const NEAR_BOTTOM_PX = 48;
 const PROMPT_TOP_INSET_PX = 48;
 const HISTORY_PREFETCH_MIN_PX = 160;
 const HISTORY_PREFETCH_MAX_PX = 480;
@@ -339,6 +339,9 @@ export const ThreadViewport = forwardRef<ThreadViewportHandle, ThreadViewportPro
   const conversationHandoffPendingRef = useRef(false);
   const conversationHandoffAnimationRef = useRef<Animation | null>(null);
   const pendingConversationScrollRef = useRef(true);
+  // Set by the bottom button when it returns a history window to the live tail:
+  // the programmatic scroll there must re-engage output follow, not settle open.
+  const explicitTailReturnRef = useRef(false);
   const pendingPromptJumpRef = useRef<string | null>(null);
   const restoreScrollAfterPrependRef =
     useRef<{ height: number; top: number } | null>(null);
@@ -501,6 +504,12 @@ export const ThreadViewport = forwardRef<ThreadViewportHandle, ThreadViewportPro
       ? messageRegionRef.current
       : viewportFrameRef.current;
   }, [hasMessages]);
+  useLayoutEffect(() => {
+    // Runs before the geometry-reconciling effects: settle paths must know
+    // whether the scroller bottom is the live tail (a detached history page
+    // bottom never engages follow).
+    threadMotionRef.current?.setLiveWindow(!historyWindow);
+  }, [historyWindow]);
   const visibleMessages = useMemo(
     () => windowMessages(messages, visibleMessageCount),
     [messages, visibleMessageCount],
@@ -797,6 +806,7 @@ export const ThreadViewport = forwardRef<ThreadViewportHandle, ThreadViewportPro
     conversationHandoffAnimationRef.current = null;
     conversationHandoffPendingRef.current = true;
     pendingConversationScrollRef.current = true;
+    explicitTailReturnRef.current = false;
     historyScrollAnchorRef.current = null;
     restoreScrollAfterPrependRef.current = null;
     anchoredTurnIdRef.current = null;
@@ -900,6 +910,11 @@ export const ThreadViewport = forwardRef<ThreadViewportHandle, ThreadViewportPro
   useLayoutEffect(() => {
     if (!pendingConversationScrollRef.current) return;
     if (!conversationReady) return;
+    const explicitTailReturn = explicitTailReturnRef.current;
+    // An explicit return may not be consumed on a view that cannot position
+    // the reader at the live tail yet (a detached history page or a
+    // still-loading live transcript), or the return would be lost.
+    if (explicitTailReturn && (historyWindow || !hasMessages)) return;
     if (!conversationKey) {
       pendingConversationScrollRef.current = false;
       scrollToBottom(false, { force: true });
@@ -907,7 +922,13 @@ export const ThreadViewport = forwardRef<ThreadViewportHandle, ThreadViewportPro
     }
     scrollToBottom(false, { force: true });
     if (!hasMessages) return;
+    explicitTailReturnRef.current = false;
     pendingConversationScrollRef.current = false;
+    if (explicitTailReturn) {
+      // A hand return to the live tail re-engages output follow, even mid-turn.
+      threadMotionRef.current?.engageLiveFollow();
+      return;
+    }
     if (activeTurnId && !submittedPromptTurnId) {
       // Let the opened transcript's lazy layout settle at the tail, but stop
       // as soon as a new message arrives or the reader takes control.
@@ -919,6 +940,7 @@ export const ThreadViewport = forwardRef<ThreadViewportHandle, ThreadViewportPro
     conversationKey,
     conversationReady,
     hasMessages,
+    historyWindow,
     messages,
     scrollToBottom,
     submittedPromptTurnId,
@@ -1425,6 +1447,7 @@ export const ThreadViewport = forwardRef<ThreadViewportHandle, ThreadViewportPro
             onClick={() => {
               navigation?.latest();
               if (historyWindow) {
+                explicitTailReturnRef.current = true;
                 pendingConversationScrollRef.current = true;
                 setVisibleMessageCount(INITIAL_HISTORY_WINDOW);
               } else scrollToBottom(true, { force: true });

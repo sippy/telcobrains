@@ -630,7 +630,7 @@ describe("ThreadViewport", () => {
     }
   });
 
-  it.each(["wheel", "touch"])("lets %s interrupt anchoring without resuming output follow at the tail", (input) => {
+  it.each(["wheel", "touch"])("lets %s interrupt anchoring, then re-engage output follow at the tail", (input) => {
     const clock = controlAnimationFrames();
     const threaded = [...submittedMessages, submittedAnswer];
     const { container, rerender } = render(<ThreadViewport messages={threaded} isStreaming />);
@@ -666,10 +666,11 @@ describe("ThreadViewport", () => {
 
     scroll(1_404);
     expect(screen.queryByRole("button", { name: "Scroll to bottom" })).not.toBeInTheDocument();
+    // Reaching the live tail by hand re-engages output follow mid-turn.
     mockScrollGeometry(scroller, 2_100, 500, scroller.scrollTop);
     act(() => window.dispatchEvent(new Event("resize")));
     clock.frame(0);
-    expect(scroller.scrollTop).toBe(1_404);
+    expect(scroller.scrollTop).toBe(1_600);
   });
 
   it("keeps uncommanded scrolling user-owned through layout changes and a tail reversal", async () => {
@@ -1765,6 +1766,143 @@ describe("ThreadViewport", () => {
     expect(latest).toHaveBeenCalledOnce();
     view.rerender(<ThreadViewport ref={viewportRef} messages={messages} isStreaming={false} composer={<div />} navigation={{ ...navigation, window: null }} />);
     await waitFor(() => expect(screen.getByText("hello")).toBeInTheDocument());
+  });
+
+  it("re-engages live-tail follow when the bottom button returns from a history window", async () => {
+    const jumpTo = vi.spyOn(ThreadCameraController.prototype, "jumpTo");
+    const live = makePromptExchangeMessages(3);
+    const historyWindow = {
+      messages: makePromptExchangeMessages(2), userMessageOffset: 0,
+      hasMoreBefore: false, hasMoreAfter: true, forkBoundaryMessageCount: null,
+    };
+    const navigation: PromptHistoryNavigation = {
+      prompts: [], window: historyWindow, target: null, operation: null, loading: false, error: null,
+      jump: vi.fn(), older: vi.fn(), newer: vi.fn(), cancel: vi.fn(), latest: vi.fn(), retry: vi.fn(),
+      expandTraceDetail: vi.fn(),
+    };
+    const { container, rerender } = render(
+      <ThreadViewport messages={live} isStreaming={false} conversationKey="chat-a"
+        composer={<div>composer</div>} navigation={navigation} />,
+    );
+    const scroller = getScroller(container);
+    mockScrollGeometry(scroller, 1_600, 500, 0);
+    act(() => window.dispatchEvent(new Event("resize")));
+    await flushAnimationFrame();
+
+    // Reading older history in a detached window does not engage live follow.
+    fireEvent.wheel(scroller, { deltaY: -200 });
+    act(() => {
+      scroller.scrollTop = 100;
+      fireEvent.scroll(scroller);
+    });
+    jumpTo.mockClear();
+
+    rerender(
+      <ThreadViewport messages={live} isStreaming activeTurnId="turn-9" conversationKey="chat-a"
+        composer={<div>composer</div>} navigation={navigation} />,
+    );
+    await flushAnimationFrame();
+    mockScrollGeometry(scroller, 1_800, 500, scroller.scrollTop);
+    act(() => window.dispatchEvent(new Event("resize")));
+    await flushAnimationFrame();
+    expect(jumpTo).not.toHaveBeenCalled();
+
+    fireEvent.click(screen.getByRole("button", { name: "Scroll to bottom" }));
+    rerender(
+      <ThreadViewport messages={live} isStreaming activeTurnId="turn-9" conversationKey="chat-a"
+        composer={<div>composer</div>} navigation={{ ...navigation, window: null }} />,
+    );
+    await flushAnimationFrame();
+    expect(scroller.scrollTop).toBe(1_300);
+
+    // Live output keeps the tail pinned after the explicit return.
+    mockScrollGeometry(scroller, 2_000, 500, scroller.scrollTop);
+    act(() => window.dispatchEvent(new Event("resize")));
+    await flushAnimationFrame();
+    expect(scroller.scrollTop).toBe(1_500);
+  });
+
+  it("keeps explicit follow alive when a restored conversation's opening follow is still settling", async () => {
+    const running = [
+      ...makePromptExchangeMessages(2),
+      { id: "running-user", role: "user" as const, content: "question", turnId: "turn-9", createdAt: 20 },
+      { id: "running-answer", role: "assistant" as const, content: "answer", turnId: "turn-9", createdAt: 21 },
+    ];
+    const { container, rerender } = render(
+      <ThreadViewport messages={running} isStreaming activeTurnId="turn-9" conversationKey="chat-a"
+        composer={<div>composer</div>} />,
+    );
+    const scroller = getScroller(container);
+    // The scrollport is still outgrowing its frame, so the opening settle
+    // stays pending across the reader's actions below.
+    mockScrollGeometry(scroller, 1_250, 500, 0);
+    act(() => window.dispatchEvent(new Event("resize")));
+    await flushAnimationFrame();
+    expect(scroller.scrollTop).toBe(750);
+
+    // The reader scrolls up to read, then returns to the live tail by hand.
+    fireEvent.wheel(scroller, { deltaY: -400 });
+    act(() => {
+      scroller.scrollTop = 350;
+      fireEvent.scroll(scroller);
+    });
+    await flushAnimationFrame();
+    act(() => {
+      scroller.scrollTop = 750;
+      fireEvent.scroll(scroller);
+    });
+    expect(scroller.scrollTop).toBe(750);
+    await flushAnimationFrame();
+
+    // The next appended message must not run the opening settle against the
+    // reader's explicit follow and silently stop it.
+    Object.defineProperty(scroller, "scrollHeight", { configurable: true, value: 1_450 });
+    rerender(
+      <ThreadViewport messages={[...running, { id: "queued-user", role: "user" as const, content: "next question", turnId: "turn-9", createdAt: 22 }]} isStreaming
+        activeTurnId="turn-9" conversationKey="chat-a" composer={<div>composer</div>} />,
+    );
+    act(() => window.dispatchEvent(new Event("resize")));
+    await flushAnimationFrame();
+    expect(scroller.scrollTop).toBe(950);
+  });
+
+  it("consumes an explicit history-window return only once the live view is renderable", async () => {
+    const live = makePromptExchangeMessages(2);
+    const historyWindow = {
+      messages: makePromptExchangeMessages(3), userMessageOffset: 0,
+      hasMoreBefore: false, hasMoreAfter: true, forkBoundaryMessageCount: null,
+    };
+    const navigation: PromptHistoryNavigation = {
+      prompts: [], window: historyWindow, target: null, operation: null, loading: false, error: null,
+      jump: vi.fn(), older: vi.fn(), newer: vi.fn(), cancel: vi.fn(), latest: vi.fn(), retry: vi.fn(),
+      expandTraceDetail: vi.fn(),
+    };
+    const { container, rerender } = render(
+      <ThreadViewport messages={[]} isStreaming={false} conversationKey="chat-a" composer={<div>composer</div>} navigation={navigation} />,
+    );
+    const scroller = getScroller(container);
+
+    // The reader returns to the tail while the live transcript is still loading.
+    fireEvent.click(screen.getByRole("button", { name: "Scroll to bottom" }));
+    rerender(
+      <ThreadViewport messages={[]} isStreaming={false} conversationKey="chat-a" composer={<div>composer</div>}
+        navigation={{ ...navigation, window: null }} />,
+    );
+    await flushAnimationFrame();
+
+    // Once live messages render, the return scrolls to the tail and re-engages follow.
+    mockScrollGeometry(scroller, 1_000, 500, 0);
+    rerender(
+      <ThreadViewport messages={live} isStreaming activeTurnId="turn-9" conversationKey="chat-a"
+        composer={<div>composer</div>} navigation={{ ...navigation, window: null }} />,
+    );
+    await flushAnimationFrame();
+    expect(scroller.scrollTop).toBe(500);
+
+    mockScrollGeometry(scroller, 1_300, 500, scroller.scrollTop);
+    act(() => window.dispatchEvent(new Event("resize")));
+    await flushAnimationFrame();
+    expect(scroller.scrollTop).toBe(800);
   });
 
   it.each(["wheel", "touch", "keyboard"] as const)("loads newer history after one %s input reaches the page bottom", async (input) => {

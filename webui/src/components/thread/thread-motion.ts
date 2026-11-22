@@ -21,7 +21,8 @@ type ThreadMotionEvent =
   | "user-scroll"
   | "boundary-scroll"
   | "composer-input"
-  | "resume-follow";
+  | "resume-follow"
+  | "engage-live-follow";
 
 type ThreadMotionTransition = ThreadMotionMode | "current-automatic-mode";
 
@@ -36,6 +37,7 @@ const THREAD_MOTION_TRANSITIONS: Readonly<
     "navigate-history": "navigating-history",
     "user-scroll": "browsing-history",
     "resume-follow": "current-automatic-mode",
+    "engage-live-follow": "follow-latest",
   },
   "follow-latest": {
     "navigate-latest": "navigating-latest",
@@ -54,15 +56,19 @@ const THREAD_MOTION_TRANSITIONS: Readonly<
     "user-scroll": "browsing-history",
     "boundary-scroll": "browsing-history",
     "resume-follow": "current-automatic-mode",
+    "engage-live-follow": "follow-latest",
   },
   "navigating-latest": {
     "navigate-latest": "navigating-latest",
     "navigate-history": "navigating-history",
-    "navigation-settled": "current-automatic-mode",
+    // Only the explicit bottom button starts this navigation, so settling at
+    // the live tail always re-engages output follow, even mid-turn.
+    "navigation-settled": "follow-latest",
     "user-scroll": "browsing-history",
     "boundary-scroll": "browsing-history",
     "composer-input": "idle",
     "resume-follow": "current-automatic-mode",
+    "engage-live-follow": "follow-latest",
   },
   "navigating-history": {
     "navigate-latest": "navigating-latest",
@@ -72,11 +78,13 @@ const THREAD_MOTION_TRANSITIONS: Readonly<
     "boundary-scroll": "browsing-history",
     "composer-input": "browsing-history",
     "resume-follow": "current-automatic-mode",
+    "engage-live-follow": "follow-latest",
   },
   "browsing-history": {
     "navigate-latest": "navigating-latest",
     "navigate-history": "navigating-history",
     "resume-follow": "current-automatic-mode",
+    "engage-live-follow": "follow-latest",
   },
 };
 
@@ -119,6 +127,7 @@ interface ThreadMotionCoordinatorOptions {
 }
 
 const GEOMETRY_EPSILON_PX = 0.5;
+export const NEAR_BOTTOM_PX = 48;
 
 type ThreadScrollOwner = "automatic" | "navigation" | "user";
 
@@ -144,11 +153,15 @@ export class ThreadMotionCoordinator {
   private readonly scheduler: ThreadMotionScheduler;
   private turnId: string | null = null;
   private mode: ThreadMotionMode = "idle";
+  // Viewport-owned: the scroller's bottom is the live tail only outside a
+  // detached history window. Never infer it from page geometry here.
+  private isLiveWindow = false;
+  private openingFollow = false;
   private historyNavigationPromptId: string | null = null;
   private submittedPromptId: string | null = null;
   private measurementFrameId: number | null = null;
   private geometryDirty = false;
-  // Only input toward latest may resume follow; layout can also return a
+  // Only input toward latest may re-engage follow; layout can also return a
   // reading position to the tail without the user scrolling forward.
   private resumeFollowArmed = false;
 
@@ -163,6 +176,10 @@ export class ThreadMotionCoordinator {
 
   snapshot(): ThreadMotionSnapshot {
     return { mode: this.mode };
+  }
+
+  setLiveWindow(live: boolean): void {
+    this.isLiveWindow = live;
   }
 
   updateTurn(turnId: string | null): void {
@@ -180,10 +197,13 @@ export class ThreadMotionCoordinator {
   followOpeningLayout(): void {
     if (this.mode !== "idle") return;
     this.mode = "follow-latest";
+    this.openingFollow = true;
     this.invalidateGeometry();
   }
 
   finishOpeningLayout(): void {
+    if (!this.openingFollow) return;
+    this.openingFollow = false;
     if (this.mode !== "follow-latest") return;
     this.camera.cancel();
     this.mode = "idle";
@@ -227,9 +247,21 @@ export class ThreadMotionCoordinator {
     this.handleUserScrollIntent(true);
   }
 
+  /**
+   * The reader explicitly asked to stay at the live tail: the bottom button, a
+   * return from a history window, or reaching the tail by hand. Follow resumes
+   * even while a turn is running and stops again on user scroll-away.
+   */
+  engageLiveFollow(): void {
+    this.openingFollow = false;
+    if (!this.transition("engage-live-follow")) return;
+    this.resumeFollowArmed = false;
+    this.invalidateGeometry();
+  }
+
   handleUserScrollIntent(canScroll: boolean, towardLatest = false): void {
     if (this.mode === "browsing-history" && towardLatest && !canScroll) {
-      this.transitionToAutoFollow(false);
+      this.engageLiveFollow();
       return;
     }
     const event = canScroll ? "user-scroll" : "boundary-scroll";
@@ -244,13 +276,9 @@ export class ThreadMotionCoordinator {
   }
 
   resumeAutoFollow(): void {
-    this.transitionToAutoFollow(true);
-  }
-
-  private transitionToAutoFollow(cancelCamera: boolean): void {
     if (!this.transition("resume-follow")) return;
     this.resumeFollowArmed = false;
-    if (cancelCamera) this.camera.cancel();
+    this.camera.cancel();
     this.onAutoFollow?.();
     this.invalidateGeometry();
   }
@@ -284,7 +312,7 @@ export class ThreadMotionCoordinator {
     this.transition("navigate-history");
     this.historyNavigationPromptId = promptId;
     const result = this.camera.navigateTo(top);
-    if (!result || result === "settled") this.transition("navigation-settled");
+    if (!result || result === "settled") this.settleHistoryNavigation();
     return result;
   }
 
@@ -294,6 +322,8 @@ export class ThreadMotionCoordinator {
     } else if (this.mode === "navigating-latest") {
       this.settleLatestNavigation();
       this.onLatestNavigationSettled?.();
+    } else if (this.mode === "navigating-history") {
+      this.settleHistoryNavigation();
     }
   }
 
@@ -323,14 +353,7 @@ export class ThreadMotionCoordinator {
         }
         return "navigation";
       case "navigating-history":
-        if (!this.camera.isFollowing()) {
-          this.transition("navigation-settled");
-          if (nearLiveTail) {
-            this.resumeAutoFollow();
-          } else {
-            this.resumeFollowArmed = false;
-          }
-        }
+        if (!this.camera.isFollowing()) this.settleHistoryNavigation();
         return "navigation";
       case "browsing-history":
         if (!nearLiveTail) {
@@ -338,7 +361,7 @@ export class ThreadMotionCoordinator {
           return "user";
         }
         if (!this.resumeFollowArmed) return "user";
-        this.resumeAutoFollow();
+        this.engageLiveFollow();
         return "automatic";
       default:
         if (!nearLiveTail) this.invalidateGeometry();
@@ -355,6 +378,7 @@ export class ThreadMotionCoordinator {
     this.camera.reset();
     this.turnId = null;
     this.resumeFollowArmed = false;
+    this.openingFollow = false;
     this.mode = "idle";
     this.historyNavigationPromptId = null;
     this.submittedPromptId = null;
@@ -392,6 +416,25 @@ export class ThreadMotionCoordinator {
 
   private settleLatestNavigation(): void {
     if (!this.transition("navigation-settled")) return;
+    this.openingFollow = false;
+    this.invalidateGeometry();
+  }
+
+  /**
+   * One settle path for prompt navigation, whether the camera finished on a
+   * scroll event, retargeted through authoritative geometry, or settled
+   * instantly (reduced motion or already at the destination). Follow re-engage
+   * only applies when the chosen prompt sits at the live tail, never at the
+   * bottom of a detached history page.
+   */
+  private settleHistoryNavigation(): void {
+    const geometry = this.isLiveWindow ? this.measure(null) : null;
+    if (!this.transition("navigation-settled")) return;
+    if (geometry && geometry.maxScrollTop - geometry.scrollTop < NEAR_BOTTOM_PX) {
+      this.engageLiveFollow();
+    } else {
+      this.resumeFollowArmed = false;
+    }
     this.invalidateGeometry();
   }
 
@@ -420,7 +463,7 @@ export class ThreadMotionCoordinator {
     if (this.mode === "navigating-history" && navigationPromptId !== null) {
       if (geometry.promptTop !== null) {
         const result = this.camera.navigateTo(geometry.promptTop);
-        if (!result || result === "settled") this.transition("navigation-settled");
+        if (!result || result === "settled") this.settleHistoryNavigation();
       }
       return;
     }

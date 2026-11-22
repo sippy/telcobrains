@@ -119,6 +119,57 @@ test("anchors the prompt with reduced motion enabled", async ({ page }) => {
   expect(errors).toEqual([]);
 });
 
+test("re-engages follow at the live tail with reduced motion", async ({ page }) => {
+  await page.emulateMedia({ reducedMotion: "reduce" });
+  await page.setViewportSize({ width: 1440, height: 800 });
+  const { emit, errors, turnId } = await openThread(page, true);
+  const viewport = page.getByTestId("thread-message-region");
+  const prompt = viewport.locator("[data-user-prompt-id]").filter({ hasText: "My anchored question" });
+  const promptOffset = () => prompt.evaluate((node) => {
+    const region = node.closest('[data-testid="thread-message-region"]')!;
+    return node.getBoundingClientRect().top - region.getBoundingClientRect().top;
+  });
+  const distanceFromBottom = () => viewport.evaluate((node) => node.scrollHeight - node.clientHeight - node.scrollTop);
+  await expect.poll(promptOffset).toBeLessThanOrEqual(48);
+  const initialOffset = await promptOffset();
+  expect(initialOffset).toBeGreaterThanOrEqual(0);
+
+  const base = { chat_id: chatId, turn_id: turnId, stream_id: "answer" };
+  emit({ event: "delta", ...base, turn_seq: 1, text: `${"Growing answer line.\n\n".repeat(60)}END-FIRST` });
+  await expect(viewport).toContainText("END-FIRST");
+  // The submitted prompt stays anchored while the turn streams.
+  expect(await promptOffset()).toBeCloseTo(initialOffset, 0);
+
+  // Reaching the live tail by hand re-engages follow for the running turn.
+  await viewport.hover();
+  for (let pass = 0; pass < 40 && (await distanceFromBottom()) > 1; pass++) {
+    await page.mouse.wheel(0, 1000);
+    await page.waitForTimeout(25);
+  }
+  await expect.poll(distanceFromBottom).toBeLessThan(1);
+  emit({ event: "delta", ...base, turn_seq: 2, text: `${"Followed growth.\n\n".repeat(40)}END-FOLLOW` });
+  await expect(viewport).toContainText("END-FOLLOW");
+  await expect.poll(distanceFromBottom).toBeLessThan(1);
+  expect(await promptOffset()).toBeLessThan(0);
+
+  // Reading older history stops follow again.
+  await viewport.hover();
+  await page.mouse.wheel(0, -600);
+  await expect.poll(distanceFromBottom).toBeGreaterThan(300);
+  const readingTop = await viewport.evaluate((node) => node.scrollTop);
+  emit({ event: "delta", ...base, turn_seq: 3, text: "\n\nMore growth." });
+  await expect(viewport).toContainText("More growth.");
+  expect(await viewport.evaluate((node) => node.scrollTop)).toBeCloseTo(readingTop, 0);
+
+  // The explicit bottom button returns to the tail and follows again.
+  await page.getByRole("button", { name: "Scroll to bottom" }).click();
+  await expect.poll(distanceFromBottom).toBeLessThan(1);
+  emit({ event: "delta", ...base, turn_seq: 4, text: `${"Final growth.\n\n".repeat(30)}END-LAST` });
+  await expect(viewport).toContainText("END-LAST");
+  await expect.poll(distanceFromBottom).toBeLessThan(1);
+  expect(errors).toEqual([]);
+});
+
 for (const width of [390, 1440]) for (const withHistory of [false, true]) {
   test(`anchors a submitted prompt without following streamed text at ${width}px, history=${withHistory}`, async ({ page }) => {
     await page.setViewportSize({ width, height: 800 });
@@ -147,6 +198,7 @@ for (const width of [390, 1440]) for (const withHistory of [false, true]) {
     }
     const initialOffset = await promptOffset();
     const initialTop = await viewport.evaluate((node) => node.scrollTop);
+    const distanceFromBottom = () => viewport.evaluate((node) => node.scrollHeight - node.clientHeight - node.scrollTop);
     const base = { chat_id: chatId, turn_id: turnId, stream_id: "answer" };
     emit({ event: "delta", ...base, turn_seq: 1, text: "The short opening." });
     await expect(page.getByText("The short opening.", { exact: true })).toBeVisible();
@@ -158,25 +210,54 @@ for (const width of [390, 1440]) for (const withHistory of [false, true]) {
     expect(await viewport.evaluate((node) => node.scrollTop)).toBeCloseTo(initialTop, 0);
     await expect.poll(promptOffset).toBeCloseTo(initialOffset, 0);
 
+    // Scrolling away mid-stream keeps the reading position stable.
     await viewport.hover();
     await page.mouse.wheel(0, 360);
+    const stableTop = () => viewport.evaluate(async (node) => {
+      let previous = node.scrollTop;
+      let stable = 0;
+      for (let i = 0; i < 600 && stable < 8; i++) {
+        await new Promise((resolve) => requestAnimationFrame(resolve));
+        if (node.scrollTop === previous) stable += 1;
+        else stable = 0;
+        previous = node.scrollTop;
+      }
+      return previous;
+    });
     await expect.poll(() => viewport.evaluate((node) => node.scrollTop)).toBeGreaterThan(initialTop + 100);
-    const readingTop = await viewport.evaluate((node) => node.scrollTop);
+    const readingTop = await stableTop();
     emit({ event: "delta", ...base, turn_seq: 3, text: `\n\n${"More streamed text.\n\n".repeat(30)}END-SECOND-BATCH` });
     await expect(viewport).toContainText("END-SECOND-BATCH");
     expect(await viewport.evaluate((node) => node.scrollTop)).toBeCloseTo(readingTop, 0);
 
-    await page.getByRole("button", { name: "Scroll to bottom" }).click();
-    await expect.poll(() => viewport.evaluate((node) => node.scrollHeight - node.clientHeight - node.scrollTop))
-      .toBeLessThanOrEqual(0.5);
-    const bottomTop = await viewport.evaluate((node) => node.scrollTop);
-    emit({ event: "delta", ...base, turn_seq: 4, text: `\n\n${"New text after navigation.\n\n".repeat(20)}END-THIRD-BATCH` });
+    // Reaching the live tail by hand re-engages follow for the running turn.
+    for (let pass = 0; pass < 40 && (await distanceFromBottom()) > 1; pass++) {
+      await page.mouse.wheel(0, 1000);
+      await page.waitForTimeout(25);
+    }
+    await expect.poll(distanceFromBottom).toBeLessThan(1);
+    emit({ event: "delta", ...base, turn_seq: 4, text: `\n\n${"Followed after reaching the tail.\n\n".repeat(20)}END-THIRD-BATCH` });
     await expect(viewport).toContainText("END-THIRD-BATCH");
-    expect(await viewport.evaluate((node) => node.scrollTop)).toBeCloseTo(bottomTop, 0);
-    emit({ event: "stream_end", ...base, turn_seq: 5 });
-    emit({ event: "turn_end", chat_id: chatId, turn_id: turnId, turn_seq: 6 });
+    await expect.poll(distanceFromBottom).toBeLessThanOrEqual(0.5);
+    expect(await viewport.evaluate((node) => node.scrollTop)).toBeGreaterThan(readingTop + 100);
+
+    // Scrolling back into history stops follow again.
+    await page.mouse.wheel(0, -600);
+    const historyTop = await stableTop();
+    emit({ event: "delta", ...base, turn_seq: 5, text: `\n\n${"Kept in view after scrolling away.\n\n".repeat(20)}END-FOURTH-BATCH` });
+    await expect(viewport).toContainText("END-FOURTH-BATCH");
+    expect(await viewport.evaluate((node) => node.scrollTop)).toBeCloseTo(historyTop, 0);
+
+    // The explicit bottom button returns to the tail and re-engages follow.
+    await page.getByRole("button", { name: "Scroll to bottom" }).click();
+    await expect.poll(distanceFromBottom).toBeLessThanOrEqual(0.5);
+    emit({ event: "delta", ...base, turn_seq: 6, text: `\n\n${"New text after navigation.\n\n".repeat(20)}END-FIFTH-BATCH` });
+    await expect(viewport).toContainText("END-FIFTH-BATCH");
+    await expect.poll(distanceFromBottom).toBeLessThanOrEqual(0.5);
+    emit({ event: "stream_end", ...base, turn_seq: 7 });
+    emit({ event: "turn_end", chat_id: chatId, turn_id: turnId, turn_seq: 8 });
     await expect(page.getByRole("button", { name: "Stop response" })).toHaveCount(0);
-    expect(await viewport.evaluate((node) => node.scrollTop)).toBeCloseTo(bottomTop, 0);
+    await expect.poll(distanceFromBottom).toBeLessThanOrEqual(0.5);
     expect(errors).toEqual([]);
   });
 }
