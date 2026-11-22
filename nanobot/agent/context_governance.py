@@ -20,7 +20,6 @@ from uuid import uuid4
 
 from loguru import logger
 
-from nanobot.agent.context import TranscriptInput
 from nanobot.context_sources import drain_system_sources
 from nanobot.events import NO_EVENTS, ContextCompactionEvent, EventSink
 from nanobot.providers.base import (
@@ -42,21 +41,25 @@ from nanobot.runtime_context import (
 from nanobot.session.history_visibility import is_hidden_history_message
 from nanobot.session.summary import (
     SUMMARY_CONTINUATION_TEXT,
+    CompactorInputBudget,
     SessionSummaryCheckpoint,
 )
 from nanobot.utils.cancellation import shield_and_drain
 from nanobot.utils.helpers import (
+    estimate_message_tokens,
     estimate_prompt_tokens_chain,
+    find_legal_message_start,
     maybe_persist_tool_result,
     truncate_text,
 )
 from nanobot.utils.runtime import ensure_nonempty_tool_result
 
 if TYPE_CHECKING:
+    from nanobot.agent.context import TranscriptInput
     from nanobot.agent.tools.registry import ToolRegistry
     from nanobot.providers.base import LLMProvider
 
-TranscriptBuilder = Callable[[TranscriptInput], list[dict[str, Any]]]
+TranscriptBuilder = Callable[["TranscriptInput"], list[dict[str, Any]]]
 SummaryTranscriptBuilder = Callable[[str], list[dict[str, Any]]]
 HistoryConsolidator = Callable[
     [list[dict[str, Any]], str | None],
@@ -132,6 +135,16 @@ class ContextGovernanceConfig:
     max_tool_result_chars: int
     context_window_tokens: int | None = None
     max_tokens: int | None = None
+    # Input tokens to keep free for the next turn's fresh input when session
+    # compaction sizes its retained tail. Charged against foreground replay
+    # headroom only; 0 keeps the existing sizing.
+    next_turn_input_reserve_tokens: int = 0
+    # Minimum of recent verbatim history to keep after session compaction,
+    # counting only the replayable raw tail (never the summary, prompt, or
+    # fresh delta). Session compaction (idle/manual/SDK) skips rather than
+    # shrink below it; in-turn context-pressure compaction ignores it so a
+    # feasible turn is never blocked. 0 disables the floor.
+    min_verbatim_tail_tokens: int = 0
 
 
 @dataclass(slots=True)
@@ -146,6 +159,7 @@ class ContextCompactionState:
     consolidate_history: HistoryConsolidator
     consolidate_provider_compaction: ProviderCompactionConsolidator | None
     summary_checkpoint: SessionSummaryCheckpoint | None = None
+    compactor_input_budget: CompactorInputBudget | None = None
 
     @classmethod
     def from_transcript(
@@ -154,6 +168,7 @@ class ContextCompactionState:
         transcript_builder: TranscriptBuilder,
         consolidate_history: HistoryConsolidator,
         consolidate_provider_compaction: ProviderCompactionConsolidator | None,
+        compactor_input_budget: CompactorInputBudget | None = None,
     ) -> tuple[list[dict[str, Any]], ContextCompactionState]:
         """Build the raw transcript and its initial H/delta boundary."""
         messages = list(transcript_builder(transcript_input))
@@ -186,6 +201,7 @@ class ContextCompactionState:
             summary_transcript_builder=build_summary_transcript,
             consolidate_history=consolidate_history,
             consolidate_provider_compaction=consolidate_provider_compaction,
+            compactor_input_budget=compactor_input_budget,
         )
 
     @classmethod
@@ -194,6 +210,7 @@ class ContextCompactionState:
         messages: list[dict[str, Any]],
         consolidate_history: HistoryConsolidator,
         consolidate_provider_compaction: ProviderCompactionConsolidator | None,
+        compactor_input_budget: CompactorInputBudget | None = None,
     ) -> ContextCompactionState:
         """Create compaction state for a standalone runner transcript."""
         raw_messages = messages
@@ -227,6 +244,7 @@ class ContextCompactionState:
             summary_transcript_builder=build_summary_transcript,
             consolidate_history=consolidate_history,
             consolidate_provider_compaction=consolidate_provider_compaction,
+            compactor_input_budget=compactor_input_budget,
         )
 
     def request_messages(
@@ -626,6 +644,191 @@ class ContextGovernor:
             transcript_boundary=transcript_boundary,
         )
 
+    @staticmethod
+    def _legal_cut_indices(raw: list[dict[str, Any]], boundary: int) -> list[bool]:
+        """Mark raw indices where the tail starting there keeps every tool pair whole.
+
+        A tail ``raw[i:boundary]`` is legal when each tool result it contains
+        is owned by an assistant message inside the same tail; a result whose
+        call sits before ``i`` (or has no call at all) would be split across
+        the compaction boundary.
+        """
+        last_declared: dict[str, int] = {}
+        owning_call: list[int | None] = [None] * boundary
+        for index, message in enumerate(raw[:boundary]):
+            role = message.get("role")
+            if role == "assistant":
+                for raw_call in cast(list[object], message.get("tool_calls") or []):
+                    call = cast(dict[str, Any], raw_call) if isinstance(raw_call, dict) else None
+                    if call is not None and call.get("id"):
+                        last_declared[str(call["id"])] = index
+            elif role == "tool":
+                tool_call_id = message.get("tool_call_id")
+                owning_call[index] = (
+                    last_declared.get(str(tool_call_id)) if tool_call_id else None
+                )
+        legal = [True] * boundary
+        suffix_min: int | None = None
+        for index in range(boundary - 1, -1, -1):
+            call = owning_call[index]
+            if call is None and raw[index].get("role") == "tool":
+                value: int | None = -1
+            elif call is not None:
+                value = call
+            else:
+                value = suffix_min
+            if value is not None and (suffix_min is None or value < suffix_min):
+                suffix_min = value
+            legal[index] = suffix_min is None or suffix_min >= index
+        return legal
+
+    def _select_prefix_cut(
+        self,
+        state: ModelRequestState,
+        compaction: ContextCompactionState,
+        delta_messages: list[dict[str, Any]],
+        tool_definitions: list[dict[str, Any]] | None,
+    ) -> int | None:
+        if compaction.compactor_input_budget is None:
+            return None
+        return self.select_prefix_cut(
+            state.config,
+            compaction.raw_messages,
+            len(compaction.accepted_messages),
+            compaction.compactor_input_budget,
+            compaction.summary_transcript_builder(""),
+            compaction.active_summary,
+            delta_messages,
+            tool_definitions,
+        )
+
+    def select_prefix_cut(
+        self,
+        config: ContextGovernanceConfig,
+        raw: list[dict[str, Any]],
+        delta_start: int,
+        budget: CompactorInputBudget | None,
+        wrapper: list[dict[str, Any]],
+        prior_summary: str | None,
+        delta_messages: list[dict[str, Any]],
+        tool_definitions: list[dict[str, Any]] | None,
+        *,
+        replay_starts_at_user: bool = False,
+        next_turn_input_reserve_tokens: int = 0,
+    ) -> int | None:
+        """Choose the oldest raw prefix to compact, protecting a verbatim tail.
+
+        Returns the raw transcript index ``i`` where compaction stops: the
+        prefix ``raw[:i]`` is summarized while the tail between ``i`` and the
+        unsent delta is kept verbatim. The oldest legal boundary satisfying
+        the additive replay budget and any session floor gets one projected
+        request probe (summary transcript, protected tail, continuation,
+        unsent delta, tools, and the summary's reserved output). The compacted
+        prefix must additionally fit the compactor's actual input budget
+        (window minus reserved output, summarization prompt, and the prior
+        summary). Any newer cut compacts a larger prefix, so when the most
+        protective cut fails the compactor budget no useful cut exists. If
+        either budget check fails, the caller chooses its usual fallback.
+
+        ``next_turn_input_reserve_tokens`` keeps that many foreground input
+        tokens free for the next turn's fresh input; session compaction (no
+        unsent delta) passes the configured reserve there. It shrinks the
+        protected tail (or yields no cut) but never reduces compactor
+        capacity, and in-turn compaction with a real delta does not pass it.
+        """
+        if budget is None or not config.context_window_tokens or delta_start < 3:
+            return None
+        input_budget = self.input_budget(config)
+        if input_budget <= 0:
+            return None
+        reserve = max(0, next_turn_input_reserve_tokens)
+
+        # Foreground headroom for the protected tail: everything the
+        # post-compaction request carries besides the tail itself.
+        wrapper_cost, _ = estimate_prompt_tokens_chain(
+            config.provider, config.model, wrapper, None,
+        )
+        delta_cost, _ = estimate_prompt_tokens_chain(
+            config.provider, config.model, delta_messages, None,
+        )
+        tools_cost, _ = estimate_prompt_tokens_chain(
+            config.provider, config.model, [], tool_definitions,
+        )
+        continuation: list[dict[str, Any]] = (
+            []
+            if any(message.get("role") == "user" for message in delta_messages)
+            else [{"role": "user", "content": SUMMARY_CONTINUATION_TEXT}]
+        )
+        continuation_cost, _ = estimate_prompt_tokens_chain(
+            config.provider, config.model, continuation, None,
+        )
+        tail_budget = (
+            input_budget
+            - wrapper_cost
+            - delta_cost
+            - tools_cost
+            - continuation_cost
+            - budget.max_summary_tokens
+            - reserve
+        )
+        if tail_budget <= 0:
+            return None
+
+        prior_summary_cost = 0
+        if prior_summary:
+            prior_summary_cost, _ = estimate_prompt_tokens_chain(
+                config.provider,
+                config.model,
+                [{"role": "user", "content": prior_summary}],
+                None,
+            )
+        prefix_capacity = (
+            budget.input_budget - budget.fixed_overhead_tokens - prior_summary_cost
+        )
+        if prefix_capacity <= 0:
+            return None
+
+        floor = config.min_verbatim_tail_tokens if replay_starts_at_user else 0
+        # A positive session floor counts only replayable history and must
+        # still leave a nonempty history prefix to summarize.
+        first_cut = max(2, len(wrapper) + 1) if floor > 0 else 2
+        if floor > tail_budget or first_cut >= delta_start:
+            return None
+        legal = self._legal_cut_indices(raw, delta_start)
+        costs = [estimate_message_tokens(message) for message in raw[:delta_start]]
+        if floor > 0 and sum(costs[len(wrapper):]) <= floor:
+            return None
+        total_cost = sum(costs)
+        cut: int | None = None
+        cut_tail_cost = 0
+        tail_cost = 0
+        for index in range(delta_start - 1, first_cut - 1, -1):
+            tail_cost += costs[index]
+            if tail_cost > tail_budget:
+                break
+            # Durable replay aligns the head of persisted history to a user turn.
+            if tail_cost >= floor and legal[index] and (not replay_starts_at_user or raw[index].get("role") == "user"):
+                cut = index
+                cut_tail_cost = tail_cost
+        if cut is None or total_cost - cut_tail_cost > prefix_capacity:
+            return None
+        if find_legal_message_start(raw[cut:delta_start]) != 0:
+            return None
+        # Probe only the oldest qualifying cut. Projecting each suffix in
+        # turn on an estimator mismatch would make sizing quadratic.
+        probe = self.prepare_messages_for_model(config, [
+            *wrapper,
+            *raw[cut:delta_start],
+            *continuation,
+            *delta_messages,
+        ])
+        probe_cost, _ = estimate_prompt_tokens_chain(
+            config.provider, config.model, probe, tool_definitions,
+        )
+        if probe_cost + budget.max_summary_tokens + reserve > input_budget:
+            return None
+        return cut
+
     async def _compact_request_history(
         self,
         state: ModelRequestState,
@@ -644,9 +847,20 @@ class ContextGovernor:
             delta_messages = await self.prepare_in_background(
                 compaction.delta_after_accepted, messages,
             )
+            cut = await self.prepare_in_background(
+                self._select_prefix_cut, state, compaction, delta_messages,
+                tool_definitions,
+            )
+            raw = compaction.raw_messages
+            if cut is None:
+                prefix_source = compaction.accepted_messages
+                protected_tail: list[dict[str, Any]] = []
+            else:
+                prefix_source = raw[:cut]
+                protected_tail = raw[cut:len(compaction.accepted_messages)]
             consolidation_prefix = await self.prepare_in_background(
                 self.prepare_messages_for_model, state.config,
-                compaction.accepted_messages,
+                prefix_source,
             )
             summary = await compaction.consolidate_history(
                 await self.prepare_in_background(deepcopy, consolidation_prefix),
@@ -675,6 +889,7 @@ class ContextGovernor:
                 self.prepare_messages_for_model, state.config,
                 [
                     *summary_transcript,
+                    *protected_tail,
                     *continuation,
                     *delta_messages,
                 ],
@@ -698,7 +913,7 @@ class ContextGovernor:
             state.usage = None
             compaction.summary_checkpoint = SessionSummaryCheckpoint(
                 summary=summary,
-                transcript_boundary=compaction.raw_accepted_boundary,
+                transcript_boundary=cut if cut is not None else compaction.raw_accepted_boundary,
             )
         except (Exception, asyncio.CancelledError) as exc:
             await state.events.emit(

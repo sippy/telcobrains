@@ -581,6 +581,18 @@
           "label": "提示长度",
           "help": "工具执行提示的字符数上限\n\n工具执行时显示的简短提示最多包含多少个字符。"
         },
+        "agents_defaults_compactor_model_override": {
+          "label": "压缩模型",
+          "help": "用于摘要压缩上下文的模型预设。会话仍使用自己的模型。\n\n留空时使用会话当前模型压缩。"
+        },
+        "agents_defaults_compactor_next_turn_input_reserve_tokens": {
+          "label": "输入预留",
+          "help": "空闲、手动或 SDK 会话压缩后保留的输入 token，让下一条消息无需再次压缩即可放入。\n\n0 保持当前行为。预留越大，逐字保留的近期历史越少。"
+        },
+        "agents_defaults_compactor_min_verbatim_tail_tokens": {
+          "label": "最小逐字尾",
+          "help": "空闲、手动或 SDK 会话压缩后逐字保留的近期历史最少 token 数。只统计可回放的尾部——摘要、提示词与新增输入均不计入。\n\n0 关闭下限，保持旧的整段归档回退。若会话无法保留这么多，将跳过而非压缩得更少。前台压缩仍会压缩以适配窗口。"
+        },
         "tools_max_session_messages_per_minute": {
           "label": "消息频率",
           "help": "工具每分钟向同一会话发消息的上限"

@@ -2,13 +2,17 @@ import asyncio
 import hashlib
 import json
 from pathlib import Path
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
+from nanobot.agent.loop import AgentLoop
 from nanobot.agent.memory import Consolidator, MemoryStore
 from nanobot.agent.subagent import SubagentManager
 from nanobot.bus.queue import MessageBus
+from nanobot.config.schema import ModelPresetConfig
 from nanobot.providers.base import GenerationSettings, LLMProvider, LLMResponse, ToolCallRequest
+from nanobot.providers.factory import ProviderSnapshot
 from nanobot.session.manager import SessionManager
 from nanobot.utils.helpers import estimate_prompt_tokens_chain
 from nanobot.utils.llm_runtime import LLMRuntime
@@ -118,3 +122,71 @@ async def test_sdk_preserves_evidence_across_transient_compaction(tmp_path, back
         assert _files(tmp_path) == before
     finally:
         await manager.close()
+
+
+async def test_subagent_consolidation_uses_compactor_preset(tmp_path):
+    """Task turns keep the subagent model; its consolidation goes to the compactor."""
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    for index in range(8):
+        lines = ["EARLY_EVIDENCE_78291" if index == 0 else f"EVIDENCE_{index}"]
+        lines += [
+            f"{n:04d} " + hashlib.sha256(f"{index}/{n}".encode()).hexdigest()[:32]
+            for n in range(330)
+        ]
+        (workspace / f"evidence-{index}.txt").write_text("\n".join(lines), encoding="utf-8")
+
+    task_provider = _EvidenceProvider()
+    compactor = MagicMock()
+    compactor.estimate_prompt_tokens = MagicMock(return_value=(100, "test-counter"))
+    compactor.aclose = AsyncMock()
+    compactor.chat_stream_with_retry = AsyncMock(
+        return_value=LLMResponse(content="- [ephemeral] Preserve EARLY_EVIDENCE_78291."),
+    )
+
+    def load_preset(name: str) -> ProviderSnapshot:
+        if name == "compactor":
+            return ProviderSnapshot(
+                provider=compactor,
+                model="compactor-model",
+                context_window_tokens=200_000,
+                signature=("model_preset", "compactor", "compactor-model"),
+                generation=GenerationSettings(max_tokens=2_048),
+                model_preset="compactor",
+            )
+        raise KeyError(f"unknown preset {name!r}")
+
+    loop = AgentLoop(
+        bus=MessageBus(),
+        provider=task_provider,
+        workspace=workspace,
+        model="test",
+        context_window_tokens=200_000,
+        model_presets={"compactor": ModelPresetConfig(
+            model="compactor-model", max_tokens=2_048, context_window_tokens=200_000,
+        )},
+        preset_snapshot_loader=load_preset,
+        compactor_model_preset="compactor",
+    )
+    runtime = LLMRuntime.capture(task_provider, "test", context_window_tokens=24_000)
+    try:
+        result = await asyncio.wait_for(
+            loop.subagents.run_inline(
+                task="Read evidence-0.txt through evidence-7.txt and retain the early identifier.",
+                session_key="test:parent",
+                runtime=runtime,
+            ),
+            timeout=30,
+        )
+    finally:
+        await loop.aclose()
+
+    assert "Completed: EARLY_EVIDENCE_78291" in result
+    assert task_provider.reads == 8
+    assert task_provider.summaries == 0, "task model must not perform consolidation"
+    assert compactor.chat_stream_with_retry.await_count >= 2, "consolidation must reach the compactor"
+    for call in compactor.chat_stream_with_retry.await_args_list:
+        assert call.kwargs["model"] == "compactor-model"
+        assert call.kwargs["max_tokens"] == 2_048
+        # The configured compactor must not receive the task model's tools.
+        assert call.kwargs["tools"] == []

@@ -551,6 +551,18 @@
         "agents_defaults_max_tool_result_chars": {"label": "Tamanho do resultado", "help": "Limite de caracteres por resultado de ferramenta enviado ao modelo.\n\nLimita a saída das ferramentas incluída no contexto do modelo."},
         "agents_defaults_provider_retry_mode": {"label": "Continuar tentando", "help": "Tente novamente após erros recuperáveis; desative para tentativas padrão.\n\nTenta novamente quando uma solicitação ao modelo falha por um erro temporário. Desative para limitar o número de tentativas."},
         "agents_defaults_tool_hint_max_length": {"label": "Tamanho do resumo", "help": "Limite de caracteres dos resumos de atividade das ferramentas.\n\nTamanho máximo das indicações breves de atividade."},
+        "agents_defaults_compactor_model_override": {
+          "label": "Modelo de compactação",
+          "help": "Predefinição de modelo que resume o contexto compactado. A conversa mantém seu próprio modelo.\n\nDeixe sem definir para compactar com o modelo ativo da conversa."
+        },
+        "agents_defaults_compactor_next_turn_input_reserve_tokens": {
+          "label": "Reserva de entrada do próximo turno",
+          "help": "Tokens de entrada mantidos livres após a compactação de sessão (ociosa, manual ou SDK) para que a próxima mensagem caiba sem compactar de novo.\n\n0 mantém o comportamento atual. Uma reserva maior mantém menos histórico recente literal."
+        },
+        "agents_defaults_compactor_min_verbatim_tail_tokens": {
+          "label": "Cauda literal mínima",
+          "help": "Mínimo de tokens de histórico recente para manter literalmente após a compactação de sessão (ociosa, manual ou SDK). Somente a cauda reproduzível conta — nunca o resumo, o prompt ou a nova entrada.\n\n0 desativa o limite e mantém o fallback de prefixo completo. Se uma sessão não puder manter tanto, é pulada em vez de compactada menor. A compactação em primeiro plano continua compactando para caber na janela."
+        },
         "tools_max_session_messages_per_minute": {"label": "Frequência de mensagens", "help": "Máximo de mensagens de ferramentas para uma sessão por minuto.\n\nLimita a frequência das mensagens enviadas pelas ferramentas à conversa."},
         "tools_exec_enable": {"label": "Ferramenta de shell", "help": "Permita que o agente execute comandos Shell.\n\nPermite que o agente execute comandos de shell."},
         "tools_file_enable": {"label": "Ferramentas de arquivos", "help": "Permita ferramentas integradas de leitura e edição de arquivos.\n\nPermite as ferramentas integradas de leitura e edição de arquivos."},

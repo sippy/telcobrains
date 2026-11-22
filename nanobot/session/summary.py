@@ -32,6 +32,22 @@ class SessionSummaryCheckpoint:
     transcript_boundary: int
 
 
+@dataclass(frozen=True, slots=True)
+class CompactorInputBudget:
+    """The history consolidator's actual input capacity for a transcript prefix.
+
+    ``input_budget`` is the compactor's context window minus its reserved
+    output (mirroring ``Consolidator.summarize_transcript``). ``fixed_overhead_tokens``
+    covers the summarization prompt and the tool definitions offered to the
+    compactor. ``max_summary_tokens`` caps the summary the compactor can emit;
+    the foreground reserves it when checking headroom for a retained tail.
+    """
+
+    input_budget: int
+    fixed_overhead_tokens: int
+    max_summary_tokens: int
+
+
 def session_summary_from_metadata(
     metadata: Mapping[str, object] | None,
     *,

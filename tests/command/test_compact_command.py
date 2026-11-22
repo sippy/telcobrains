@@ -14,6 +14,8 @@ from nanobot.bus.queue import MessageBus
 from nanobot.bus.runtime_events import TurnCompleted
 from nanobot.command.builtin import cmd_compact, cmd_stop
 from nanobot.command.router import CommandContext
+from nanobot.events import ContextCompactionEvent as AgentCompactionEvent
+from nanobot.events import EventSink
 from nanobot.providers.base import GenerationSettings, LLMResponse, ProviderConversationState
 from nanobot.runtime_context import public_history_message
 from nanobot.session.history_visibility import is_hidden_history_message
@@ -76,6 +78,71 @@ async def test_compact_session_io_runs_outside_event_loop(loop, monkeypatch) -> 
     assert "load" in calls and "save" in calls
     monkeypatch.undo()
     assert loop.sessions.get_or_create(key).provider_state is None
+
+
+async def test_empty_compact_with_floor_replies_without_summarizing(loop) -> None:
+    loop.compactor_min_verbatim_tail_tokens = 90_000
+    reply = await loop._process_message(
+        InboundMessage(channel="cli", sender_id="user", chat_id="empty", content="/compact"),
+        runtime=loop.llm_runtime(),
+    )
+    assert reply is not None
+    assert reply.content == "No history to compact."
+    assert loop.bus.outbound_size == 0
+    loop.provider.chat_stream_with_retry.assert_not_awaited()
+
+
+async def test_floor_skip_does_not_mark_a_replaced_session(loop, monkeypatch) -> None:
+    key = "cli:test"
+    session = loop.sessions.get_or_create(key)
+    session.add_message("user", "old question")
+    loop.sessions.save(session)
+    loop.compactor_min_verbatim_tail_tokens = 90_000
+    governor = loop.consolidator._context_governor
+    prepare = governor.prepare_in_background
+
+    async def prepare_then_reset(*args):
+        result = await prepare(*args)
+        await loop.sessions.state.reset(key)
+        return result
+
+    monkeypatch.setattr(governor, "prepare_in_background", prepare_then_reset)
+    runtime, tools, no_tool_contract, replay_config = await loop.compaction_runtime_for_session(session)
+    assert await loop.consolidator.compact_idle_session(
+        key, runtime=runtime, tools=tools, no_tool_contract=no_tool_contract, replay_config=replay_config,
+    ) == ""
+    replacement = await loop.sessions.state.get(key)
+    assert replacement.generation != session.generation
+    assert "_min_tail_skip" not in replacement.metadata
+    loop.provider.chat_stream_with_retry.assert_not_awaited()
+
+
+@pytest.mark.parametrize(("error", "phase"), [(OSError, "failed"), (asyncio.CancelledError, "cancelled")])
+async def test_compaction_sizing_error_emits_paired_lifecycle(loop, monkeypatch, error, phase) -> None:
+    key = "cli:test"
+    session = loop.sessions.get_or_create(key)
+    session.add_message("user", "old question")
+    loop.sessions.save(session)
+    loop.compactor_min_verbatim_tail_tokens = 90_000
+    loop.provider.estimate_prompt_tokens.return_value = (100, "test")
+    monkeypatch.setattr(
+        loop.consolidator._context_governor, "prepare_in_background", AsyncMock(side_effect=error),
+    )
+    runtime, tools, no_tool_contract, replay_config = await loop.compaction_runtime_for_session(session)
+    publish = AsyncMock()
+    with pytest.raises(error):
+        await loop.consolidator.compact_idle_session(
+            key, runtime=runtime, tools=tools, no_tool_contract=no_tool_contract, replay_config=replay_config,
+            events=EventSink(publish=publish), reason="manual", notify=True,
+        )
+    started, terminal = [call.args[0] for call in publish.await_args_list]
+    assert isinstance(started, AgentCompactionEvent)
+    assert isinstance(terminal, AgentCompactionEvent)
+    assert (started.phase, terminal.phase) == ("started", phase)
+    assert started.compaction_id == terminal.compaction_id
+    assert started.reason == terminal.reason == "manual"
+    assert started.notify and terminal.notify
+    loop.provider.chat_stream_with_retry.assert_not_awaited()
 
 
 async def test_compact_lock_contention_keeps_heartbeat_running(loop) -> None:

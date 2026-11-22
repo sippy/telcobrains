@@ -221,6 +221,7 @@ class SubagentManager:
         max_concurrent_subagents: int | None = None,
         *,
         consolidator: Consolidator,
+        compaction_runtime_selector: Callable[[LLMRuntime], tuple[LLMRuntime, bool, bool]] | None = None,
         network_config: NetworkConfig | None = None,
         session_manager: SessionManager | None = None,
     ):
@@ -269,6 +270,7 @@ class SubagentManager:
             else defaults.max_concurrent_subagents
         )
         self.consolidator = consolidator
+        self._compaction_runtime_selector = compaction_runtime_selector
         self._run_slots = asyncio.Semaphore(self.max_concurrent_subagents)
         self.runner = AgentRunner()
         self._exec_session_manager = ExecSessionManager()
@@ -835,6 +837,19 @@ class SubagentManager:
             raise asyncio.CancelledError
         return outcome.result
 
+    def _select_compaction_runtime(self, runtime: LLMRuntime) -> tuple[LLMRuntime, bool, bool]:
+        """Choose the runtime that consolidates this task's context.
+
+        Task turns always run on *runtime* (the subagent's own model); only
+        the consolidation calls may be routed to a configured compactor.
+        Returns the compaction runtime, whether it can resume *runtime*'s
+        provider state, and whether the consolidation request may offer the
+        task's tool definitions (see AgentLoop.select_compaction_runtime).
+        """
+        if self._compaction_runtime_selector is None:
+            return runtime, True, True
+        return self._compaction_runtime_selector(runtime)
+
     async def _run_admitted_subagent(self, record: _SubagentTask) -> _SubagentOutcome:
         status, origin, runtime = record.status, record.origin, record.runtime
         task_id, label = status.task_id, status.label
@@ -905,19 +920,27 @@ class SubagentManager:
         token = bind_workspace_scope(workspace_scope) if workspace_scope is not None else None
         try:
             tool_definitions = tools.get_definitions()
+            compaction_runtime, state_resumable, offers_compaction_tools = (
+                self._select_compaction_runtime(runtime)
+            )
+            consolidation_tools = tool_definitions if offers_compaction_tools else []
+            no_compaction_tool_calls = not offers_compaction_tools
             consolidate_history = partial(
                 self.consolidator.summarize_transcript,
-                runtime=runtime,
+                runtime=compaction_runtime,
                 session_key=record.session.key,
-                tools=tool_definitions,
+                tools=consolidation_tools,
+                no_tool_contract=no_compaction_tool_calls,
                 persist=False,
             )
             consolidate_provider_compaction = partial(
                 self.consolidator.summarize_provider_compaction,
-                runtime=runtime,
+                runtime=compaction_runtime,
                 session_key=record.session.key,
-                tools=tool_definitions,
+                tools=consolidation_tools,
+                no_tool_contract=no_compaction_tool_calls,
                 persist=False,
+                allow_provider_state=state_resumable,
             )
             result = await self.runner.run(AgentRunSpec(
                 initial_messages=messages,

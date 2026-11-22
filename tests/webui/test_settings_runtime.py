@@ -149,6 +149,18 @@ def test_runtime_patch_persists_and_preserves_other_domains(tmp_path):
     {"tools.exec.sandbox": "unknown"},
     {"agents.defaults.dream.cron": "not a cron"},
     {"agents.defaults.dream.model_override": "missing"},
+    {"agents.defaults.compactor.model_override": "unknown"},
+    {"agents.defaults.compactor.model_override": "default"},
+    {"agents.defaults.compactor.model_override": 3},
+    {"agents.defaults.compactor.model_override": ["compactor"]},
+    {"agents.defaults.compactor.next_turn_input_reserve_tokens": -1},
+    {"agents.defaults.compactor.next_turn_input_reserve_tokens": 1.5},
+    {"agents.defaults.compactor.next_turn_input_reserve_tokens": "512"},
+    {"agents.defaults.compactor.next_turn_input_reserve_tokens": True},
+    {"agents.defaults.compactor.min_verbatim_tail_tokens": -1},
+    {"agents.defaults.compactor.min_verbatim_tail_tokens": 1.5},
+    {"agents.defaults.compactor.min_verbatim_tail_tokens": "90000"},
+    {"agents.defaults.compactor.min_verbatim_tail_tokens": True},
     {"agents.defaults.timezone_mode": "manual", "agents.defaults.timezone": "Mars/Olympus"},
     {"gateway.port": 65536},
     {"gateway.heartbeat.interval_s": 0},
@@ -284,6 +296,71 @@ def test_idle_compaction_settings_roundtrip_and_restart_contract(tmp_path):
         unchanged = services.mutate(update_runtime_config_settings, {key: minutes})
         assert unchanged["runtime_config"][key] == minutes
         assert unchanged["requires_restart"] is False
+
+
+def test_compactor_settings_roundtrip_unset_and_validation(tmp_path):
+    path = tmp_path / "config.json"
+    config = Config.model_validate({
+        "modelPresets": {"compactor": {"model": "local-model", "provider": "custom"}},
+    })
+    save_config(config, path)
+    model_key = "agents.defaults.compactor.model_override"
+    reserve_key = "agents.defaults.compactor.next_turn_input_reserve_tokens"
+    # Unset: session-model compaction with the default (no-reserve) sizing.
+    assert runtime_config_payload(config)[model_key] is None
+    assert runtime_config_payload(config)[reserve_key] == 0
+
+    payload = update_runtime_config_settings(
+        {model_key: "compactor", reserve_key: 512}, local_browser=True, config_path=path,
+    )
+    assert payload["runtime_config"][model_key] == "compactor"
+    assert payload["runtime_config"][reserve_key] == 512
+    assert payload["requires_restart"]
+    saved = load_config(path)
+    assert saved.agents.defaults.compactor.model_override == "compactor"
+    assert saved.agents.defaults.compactor.next_turn_input_reserve_tokens == 512
+    # The preset and the rest of the config survive the round trip.
+    assert saved.model_presets["compactor"].model == "local-model"
+    raw = json.loads(path.read_text(encoding="utf-8"))
+    assert raw["agents"]["defaults"]["compactor"]["modelOverride"] == "compactor"
+    assert raw["agents"]["defaults"]["compactor"]["nextTurnInputReserveTokens"] == 512
+
+    # Clearing the preset restores session-model compaction; the reserve stays.
+    payload = update_runtime_config_settings(
+        {model_key: None, reserve_key: 0}, local_browser=True, config_path=path,
+    )
+    assert payload["runtime_config"][model_key] is None
+    assert payload["runtime_config"][reserve_key] == 0
+    saved = load_config(path)
+    assert saved.agents.defaults.compactor.model_override is None
+    assert saved.agents.defaults.compactor.next_turn_input_reserve_tokens == 0
+
+
+def test_min_verbatim_tail_floor_round_trip(tmp_path):
+    path = tmp_path / "config.json"
+    save_config(Config(), path)
+    floor_key = "agents.defaults.compactor.min_verbatim_tail_tokens"
+    # Unset: the default 90k floor applies.
+    assert runtime_config_payload(Config())[floor_key] == 90_000
+
+    payload = update_runtime_config_settings(
+        {floor_key: 120_000}, local_browser=True, config_path=path,
+    )
+    assert payload["runtime_config"][floor_key] == 120_000
+    saved = load_config(path)
+    assert saved.agents.defaults.compactor.min_verbatim_tail_tokens == 120_000
+    raw = json.loads(path.read_text(encoding="utf-8"))
+    assert raw["agents"]["defaults"]["compactor"]["minVerbatimTailTokens"] == 120_000
+
+    # 0 disables the floor (legacy full-prefix fallback).
+    payload = update_runtime_config_settings(
+        {floor_key: 0}, local_browser=True, config_path=path,
+    )
+    assert payload["runtime_config"][floor_key] == 0
+    saved = load_config(path)
+    assert saved.agents.defaults.compactor.min_verbatim_tail_tokens == 0
+    raw = json.loads(path.read_text(encoding="utf-8"))
+    assert raw["agents"]["defaults"]["compactor"]["minVerbatimTailTokens"] == 0
 
 
 def test_idle_compaction_legacy_config_can_be_read_and_updated(tmp_path):

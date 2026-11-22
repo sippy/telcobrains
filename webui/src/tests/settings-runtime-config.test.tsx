@@ -337,6 +337,61 @@ describe("Runtime configuration settings", () => {
     expect(onChange).toHaveBeenCalledWith("Asia/Calcutta");
   });
 
+  it("saves compactor settings in System → Sessions", async () => {
+    const payload = runtimeSettings();
+    payload.runtime_config = {
+      ...payload.runtime_config,
+      "agents.defaults.compactor.model_override": null,
+      "agents.defaults.compactor.next_turn_input_reserve_tokens": 0,
+      "agents.defaults.compactor.min_verbatim_tail_tokens": 90_000,
+    };
+    requestMutationMock.mockImplementation(async (_method, update) => {
+      payload.runtime_config = { ...payload.runtime_config, ...update.values };
+      return { ...payload };
+    });
+    renderSettingsView({ initialSection: "runtime", initialSettings: payload });
+    const sessions = within(screen.getByRole("region", { name: "Sessions" }));
+    fireEvent.click(sessions.getByRole("combobox", { name: "Compaction model" }));
+    expect(screen.getByRole("option", { name: "Use active model" })).toBeInTheDocument();
+    expect(screen.getByRole("option", { name: "primary" })).toBeInTheDocument();
+    // The implicit "default" preset is rejected for the compactor.
+    expect(screen.queryByRole("option", { name: "default" })).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole("option", { name: "primary" }));
+    await waitFor(() => expect(requestMutationMock).toHaveBeenCalledWith(
+      "settings.runtime_config.update",
+      { values: { "agents.defaults.compactor.model_override": "primary" } },
+      20_000,
+    ));
+    const reserve = sessions.getByRole("spinbutton", { name: "Next-turn input reserve" });
+    expect(reserve).toHaveValue(0);
+    fireEvent.change(reserve, { target: { value: "512" } });
+    await waitFor(() => expect(requestMutationMock).toHaveBeenCalledWith(
+      "settings.runtime_config.update",
+      { values: { "agents.defaults.compactor.next_turn_input_reserve_tokens": 512 } },
+      20_000,
+    ), { timeout: 3_000 });
+    const floor = sessions.getByRole("spinbutton", { name: "Min. verbatim tail" });
+    expect(floor).toHaveValue(90_000);
+    await waitFor(() => expect(floor).toBeEnabled());
+    fireEvent.change(floor, { target: { value: "-1" } });
+    expect(await sessions.findByRole("alert")).toBeVisible();
+    expect(floor).toHaveAttribute("aria-invalid", "true");
+    expect(requestMutationMock).toHaveBeenCalledTimes(2);
+    fireEvent.change(floor, { target: { value: "120000" } });
+    await waitFor(() => expect(requestMutationMock).toHaveBeenLastCalledWith(
+      "settings.runtime_config.update",
+      { values: { "agents.defaults.compactor.min_verbatim_tail_tokens": 120_000 } },
+      20_000,
+    ));
+    await waitFor(() => expect(floor).toBeEnabled());
+    fireEvent.change(floor, { target: { value: "0" } });
+    await waitFor(() => expect(requestMutationMock).toHaveBeenCalledWith(
+      "settings.runtime_config.update",
+      { values: { "agents.defaults.compactor.min_verbatim_tail_tokens": 0 } },
+      20_000,
+    ), { timeout: 3_000 });
+  });
+
   it("selects a manual timezone from search results and persists both fields", async () => {
     const payload = runtimeSettings();
     vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL) =>

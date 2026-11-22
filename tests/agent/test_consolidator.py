@@ -1303,7 +1303,7 @@ class TestCompactIdleSession:
         assert sent_messages[2]["tool_calls"][0]["id"] == "call-1"
         assert sent_messages[-1]["content"] == _ARCHIVE_PROMPT
         assert call["tools"] == tools
-        assert "tool_choice" not in call
+        assert call["tool_choice"] is None
 
         reloaded = sessions.get_or_create("cli:tool-history")
         assert len(reloaded.messages) == 5
@@ -1359,8 +1359,8 @@ class TestCompactIdleSession:
         assert first_call.kwargs["tools"] == recovery_call.kwargs["tools"] == tools
         assert first_call.kwargs["provider_context"] is None
         assert recovery_call.kwargs["provider_context"] is None
-        assert "tool_choice" not in first_call.kwargs
-        assert "tool_choice" not in recovery_call.kwargs
+        assert first_call.kwargs["tool_choice"] is None
+        assert recovery_call.kwargs["tool_choice"] is None
         recovery_messages = recovery_call.kwargs["messages"]
         assert [message["role"] for message in recovery_messages[-3:]] == [
             "assistant",
@@ -1380,19 +1380,20 @@ class TestCompactIdleSession:
         assert sessions.get_or_create("cli:unexpected-tool").last_archived == 2
 
     @pytest.mark.asyncio
-    async def test_repeated_tool_call_response_uses_raw_fallback(
+    async def test_tool_call_response_uses_raw_fallback_without_recovery(
         self,
         real_consolidator,
         mock_provider,
         store,
         runtime,
     ):
+        """A tool-free request must not replay an unsolicited call transcript."""
         tool_response = LLMResponse(
             content=None,
             tool_calls=[ToolCallRequest(id="call-1", name="lookup", arguments={})],
             finish_reason="tool_calls",
         )
-        mock_provider.chat_stream_with_retry.side_effect = [tool_response, tool_response]
+        mock_provider.chat_stream_with_retry.side_effect = [tool_response]
         sessions = real_consolidator.sessions
         session = sessions.get_or_create("cli:repeated-tool")
         session.add_message("user", "remember this")
@@ -1406,7 +1407,7 @@ class TestCompactIdleSession:
 
         assert result is not None
         assert "[RAW]" in result
-        assert mock_provider.chat_stream_with_retry.await_count == 2
+        assert mock_provider.chat_stream_with_retry.await_count == 1
         entries = store.read_unprocessed_history(since_cursor=0)
         assert len(entries) == 1
         assert "important answer" in entries[0]["content"]

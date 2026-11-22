@@ -7,6 +7,8 @@ export interface RuntimeConfigField {
   manual?: boolean;
   min?: number;
   max?: number;
+  /** For preset pickers: include the implicit "default" preset among the options. */
+  includesDefault?: boolean;
 }
 
 export type RuntimeConfigPage = "memory" | "runtime" | "advanced" | "browser" | "network" | "image";
@@ -39,6 +41,9 @@ export const RUNTIME_CONFIG_FIELDS: RuntimeConfigField[] = [
   { group: "execution", path: "agents.defaults.tool_hint_max_length", kind: "number", min: 20, max: 500 },
   { group: "execution", path: "tools.max_session_messages_per_minute", kind: "number", min: 1 },
   { group: "sessions", path: "agents.defaults.session_ttl_minutes", kind: "idle-compaction", manual: true },
+  { group: "sessions", path: "agents.defaults.compactor.model_override", kind: "preset", includesDefault: false },
+  { group: "sessions", path: "agents.defaults.compactor.next_turn_input_reserve_tokens", kind: "number", min: 0 },
+  { group: "sessions", path: "agents.defaults.compactor.min_verbatim_tail_tokens", kind: "number", min: 0 },
   { group: "tools", path: "tools.exec.enable", kind: "boolean" },
   { group: "tools", path: "tools.file.enable", kind: "boolean" },
   { group: "web", path: "tools.web.enable", kind: "boolean" },

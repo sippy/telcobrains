@@ -92,6 +92,9 @@ def _make_fake_compact(
         key: str,
         *,
         runtime,
+        tools=None,
+        no_tool_contract=False,
+        replay_config=None,
         max_suffix: int = 8,
         trigger: str = "policy",
         events=NO_EVENTS,
@@ -134,12 +137,12 @@ async def test_heartbeat_idle_compaction_persists_summary_without_channel_notice
     session.metadata["_compaction_route"] = {"channel": "telegram", "chat_id": "chat"}
     session.updated_at = datetime.now() - timedelta(minutes=20)
     loop.sessions.save(session)
-    loop.consolidator.archive_session = AsyncMock(return_value="Heartbeat summary.")
+    loop.provider.chat_stream_with_retry.return_value = LLMResponse(content="Heartbeat summary.")
 
-    await loop.auto_compact.check_expired(loop.schedule_background, loop.runtime_for_session)
+    await loop.auto_compact.check_expired(loop.schedule_background, loop.compaction_runtime_for_session)
     await _drain_background_tasks(loop)
 
-    loop.consolidator.archive_session.assert_awaited_once()
+    loop.provider.chat_stream_with_retry.assert_awaited_once()
     loop.sessions.invalidate(HEARTBEAT_SESSION_KEY)
     refreshed = loop.sessions.get_or_create(HEARTBEAT_SESSION_KEY)
     assert refreshed.metadata["_last_summary"]["text"] == "Heartbeat summary."
@@ -163,7 +166,7 @@ async def test_idle_compaction_emits_its_real_trigger_for_each_phase(tmp_path, m
             error = asyncio.CancelledError() if outcome == "cancelled" else RuntimeError("summary failed")
             loop.consolidator.archive_session = AsyncMock(side_effect=error)
 
-        await loop.auto_compact.check_expired(loop.schedule_background, loop.runtime_for_session)
+        await loop.auto_compact.check_expired(loop.schedule_background, loop.compaction_runtime_for_session)
         await _drain_background_tasks(loop)
 
         events = [loop.bus.outbound.get_nowait().event for _ in range(loop.bus.outbound_size)]
@@ -258,7 +261,7 @@ async def test_turn_resuming_during_archive_commits_reply(tmp_path, monkeypatch,
     compact_task = None
     try:
         if compaction == "idle":
-            await loop.auto_compact.check_expired(loop.schedule_background, loop.runtime_for_session)
+            await loop.auto_compact.check_expired(loop.schedule_background, loop.compaction_runtime_for_session)
         else:
             compact_task = asyncio.create_task(getattr(RuntimeClient(loop), compaction)(session.key))
         await asyncio.wait_for(entered.wait(), 5)
@@ -397,7 +400,7 @@ class TestAutoCompact:
         loop.sessions.save(s2)
 
         loop.consolidator.compact_idle_session = _make_fake_compact(loop)
-        await loop.auto_compact.check_expired(loop.schedule_background, loop.runtime_for_session)
+        await loop.auto_compact.check_expired(loop.schedule_background, loop.compaction_runtime_for_session)
         await _drain_background_tasks(loop)
 
         active_after = loop.sessions.get_or_create("cli:active")
@@ -849,7 +852,7 @@ class TestProactiveAutoCompact:
         """Helper: run check_expired via callback and wait for background tasks."""
         await loop.auto_compact.check_expired(
             loop.schedule_background,
-            loop.runtime_for_session,
+            loop.compaction_runtime_for_session,
             active_session_keys=active_session_keys,
         )
         await _drain_background_tasks(loop)
@@ -977,11 +980,11 @@ class TestProactiveAutoCompact:
 
         loop.consolidator.compact_idle_session = _slow_compact
 
-        await loop.auto_compact.check_expired(loop.schedule_background, loop.runtime_for_session)
+        await loop.auto_compact.check_expired(loop.schedule_background, loop.compaction_runtime_for_session)
         await started.wait()
         assert archive_count == 1
 
-        await loop.auto_compact.check_expired(loop.schedule_background, loop.runtime_for_session)
+        await loop.auto_compact.check_expired(loop.schedule_background, loop.compaction_runtime_for_session)
         assert archive_count == 1
 
         block_forever.set()
@@ -1343,9 +1346,9 @@ async def test_idle_compaction_rechecks_settled_activity(tmp_path, monkeypatch, 
             await release.wait()
         return LLMResponse(content="completed reply", tool_calls=[])
 
-    async def archive(captured, **_kwargs):
-        if captured.key == key:
-            archived.append([message.get("content") for message in captured.messages])
+    async def summarize(prefix, _previous_summary, *, session_key, **_kwargs):
+        if session_key == key:
+            archived.append([message.get("content") for message in prefix])
         return "Idle summary."
 
     async def finish_turn():
@@ -1363,7 +1366,7 @@ async def test_idle_compaction_rechecks_settled_activity(tmp_path, monkeypatch, 
         await asyncio.wait_for(settled.wait(), 5)
 
     loop.provider.chat_stream_with_retry.side_effect = respond
-    loop.consolidator.archive_session = archive
+    loop.consolidator.summarize_transcript = summarize
     try:
         if ordering == "archive_queued_before_turn":
             loop._next_idle_compact_check_at = 0
@@ -1391,8 +1394,9 @@ async def test_idle_compaction_rechecks_settled_activity(tmp_path, monkeypatch, 
         await loop._check_expired_sessions_if_due()
         await asyncio.wait_for(_drain_background_tasks(loop), 5)
         assert len(archived) == 1
-        assert "completed reply" in archived[0]
+        assert "msg assistant 0" in archived[0]
         saved = await loop.sessions.state.get(key)
+        assert saved.get_history()[-1]["content"] == "completed reply"
         assert saved.metadata["_last_summary"]["text"] == "Idle summary."
         assert key not in loop.auto_compact._archiving
     finally:

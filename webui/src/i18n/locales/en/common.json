@@ -581,6 +581,18 @@
           "label": "Summary length",
           "help": "Character limit for tool activity summaries.\n\nMaximum number of characters shown in a tool activity summary."
         },
+        "agents_defaults_compactor_model_override": {
+          "label": "Compaction model",
+          "help": "Model preset that summarizes compacted context. The session keeps its own model.\n\nLeave unset to compact with the session's active model."
+        },
+        "agents_defaults_compactor_next_turn_input_reserve_tokens": {
+          "label": "Next-turn input reserve",
+          "help": "Input tokens to keep free after idle, manual, or SDK session compaction so the next message fits without compacting again.\n\n0 keeps the current behavior. A larger reserve keeps less recent history verbatim."
+        },
+        "agents_defaults_compactor_min_verbatim_tail_tokens": {
+          "label": "Min. verbatim tail",
+          "help": "Minimum tokens of recent history to keep verbatim after idle, manual, or SDK session compaction. Only the replayable tail counts — the summary, prompt, and fresh input never do.\n\n0 disables the floor and keeps the legacy full-prefix fallback. If a session cannot keep this much, it is skipped rather than compacted smaller. Foreground compaction still compacts to fit the window."
+        },
         "tools_max_session_messages_per_minute": {
           "label": "Message rate",
           "help": "Maximum tool messages to one session per minute.\n\nMaximum number of messages tools can send to the same session each minute."

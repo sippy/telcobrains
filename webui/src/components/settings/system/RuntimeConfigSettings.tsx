@@ -245,7 +245,10 @@ export function RuntimeConfigSettings({
                       "aria-invalid": state.invalidField === field.path || undefined,
                     };
                     const options = field.kind === "preset"
-                      ? ["", ...new Set(["default", ...settings.model_presets.map((preset) => preset.name)])]
+                      ? ["", ...new Set([
+                          ...(field.includesDefault === false ? [] : ["default"]),
+                          ...settings.model_presets.map((preset) => preset.name),
+                        ])]
                       : [...field.options ?? []];
                     // Keep a configured preset visible if it is no longer available.
                     if (field.kind === "preset" && current && !options.includes(String(current))) options.push(String(current));

@@ -21,6 +21,7 @@ from nanobot.agent import context as agent_context
 from nanobot.agent import model_presets as preset_helpers
 from nanobot.agent.autocompact import AutoCompact
 from nanobot.agent.context import ContextBuilder, PersistedPromptContextResolver, TranscriptInput
+from nanobot.agent.context_governance import ContextGovernanceConfig
 from nanobot.agent.cron_turns import CronTurnCoordinator
 from nanobot.agent.execution_policy import ExecutionControlError, ExecutionPolicy, ExecutionScope
 from nanobot.agent.hook import AgentHook, AgentTurnHookFactory
@@ -271,6 +272,67 @@ class AgentLoop:
             return None
         return self.runtime_resolver.resolve_preset(self.dream_model_preset)
 
+    def compactor_runtime(self) -> LLMRuntime | None:
+        """Resolve the optional preset used for compaction without changing defaults."""
+        if not self.compactor_model_preset:
+            return None
+        return self.runtime_resolver.resolve_preset(self.compactor_model_preset)
+
+    def select_compaction_runtime(self, runtime: LLMRuntime) -> tuple[LLMRuntime, bool, bool]:
+        """Return the compaction runtime and its request constraints.
+
+        The second value says whether the compactor can resume *runtime*'s
+        provider state. Provider-private continuation state only replays on
+        the provider and model that produced it; a separate compactor
+        summarizes the local transcript instead (see
+        Consolidator.summarize_provider_compaction). The third value says
+        whether the compaction request may offer *runtime*'s tool definitions:
+        a configured compactor summarizes without tools, because the task
+        model's schemas are meaningless to it and small local models may call
+        them instead of summarizing.
+        """
+        compactor = self.compactor_runtime()
+        if compactor is None:
+            return runtime, True, True
+        resumable = compactor.provider is runtime.provider and compactor.model == runtime.model
+        return compactor, resumable, False
+
+    async def compaction_runtime_for_session(
+        self, session: Session,
+    ) -> tuple[LLMRuntime, list[dict[str, Any]], bool, ContextGovernanceConfig]:
+        """Resolve compactor routing and the foreground replay budget.
+
+        Returns the compaction runtime, the tool set offered to the
+        summarizer (the session tool registry by default, or ``[]`` when a
+        configured compactor performs the summarization), and whether the
+        request carries the explicit no-tools contract. The contract belongs
+        to the configured-compactor policy only: legacy no-override
+        compaction keeps its existing request shape, even when the session's
+        tool registry happens to be empty. The final value describes the
+        session model that will replay the summary and retained tail,
+        including the optional input tokens reserved for the next turn's
+        fresh input during that session compaction and the minimum of
+        recent verbatim history the compaction must keep (below which session
+        compaction skips instead of shrinking).
+        """
+        foreground = await self.runtime_for_session(session)
+        runtime, _resumable, offers_tools = self.select_compaction_runtime(foreground)
+        tools = self.tools.get_definitions() if offers_tools else []
+        replay_config = ContextGovernanceConfig(
+            provider=foreground.provider,
+            model=foreground.model,
+            tools=self.tools,
+            # This is a budget probe, not a live turn: never spill tool results.
+            workspace=None,
+            session_key=session.key,
+            max_tool_result_chars=self.max_tool_result_chars,
+            context_window_tokens=foreground.context_window_tokens,
+            max_tokens=foreground.generation.max_tokens,
+            next_turn_input_reserve_tokens=self.compactor_next_turn_input_reserve_tokens,
+            min_verbatim_tail_tokens=self.compactor_min_verbatim_tail_tokens,
+        )
+        return runtime, tools, not offers_tools, replay_config
+
     _RUNTIME_CHECKPOINT_KEY = "runtime_checkpoint"
     _PENDING_USER_TURN_KEY = "pending_user_turn"
     _PROVIDER_STATE_CHECKPOINT_VERSION_KEY = "provider_state_checkpoint_version"
@@ -305,6 +367,9 @@ class AgentLoop:
         preset_catalog_loader: preset_helpers.PresetCatalogLoader | None = None,
         model_preset: str | None = None,
         dream_model_preset: str | None = None,
+        compactor_model_preset: str | None = None,
+        compactor_next_turn_input_reserve_tokens: int = 0,
+        compactor_min_verbatim_tail_tokens: int = 0,
         preset_snapshot_loader: preset_helpers.PresetSnapshotLoader | None = None,
         turn_delivery_factory: TurnDeliveryFactory | None = None,
         runtime_model_publisher: Callable[[str, str | None], None] | None = None,
@@ -356,6 +421,13 @@ class AgentLoop:
             preset_snapshot_loader=preset_snapshot_loader,
         )
         self.dream_model_preset = dream_model_preset
+        self.compactor_model_preset = compactor_model_preset
+        self.compactor_next_turn_input_reserve_tokens = max(
+            0, compactor_next_turn_input_reserve_tokens,
+        )
+        self.compactor_min_verbatim_tail_tokens = max(
+            0, compactor_min_verbatim_tail_tokens,
+        )
         self.max_tool_result_chars = (
             max_tool_result_chars
             if max_tool_result_chars is not None
@@ -409,6 +481,7 @@ class AgentLoop:
             max_iterations=self.max_iterations,
             max_concurrent_subagents=max_concurrent_subagents,
             consolidator=self.consolidator,
+            compaction_runtime_selector=self.select_compaction_runtime,
             session_manager=self.sessions,
         )
         self._running = False
@@ -512,6 +585,9 @@ class AgentLoop:
             model_presets=preset_helpers.configured_model_presets(config),
             model_preset=defaults.model_preset,
             dream_model_preset=defaults.dream.model_override,
+            compactor_model_preset=defaults.compactor.model_override,
+            compactor_next_turn_input_reserve_tokens=defaults.compactor.next_turn_input_reserve_tokens,
+            compactor_min_verbatim_tail_tokens=defaults.compactor.min_verbatim_tail_tokens,
             restart_mode=config.gateway.restart_mode,
             provider_snapshot_loader=provider_snapshot_loader,
             preset_snapshot_loader=preset_snapshot_loader,
@@ -1285,6 +1361,16 @@ class AgentLoop:
                 run_extra_hooks_for_ephemeral=run_extra_hooks_for_ephemeral,
                 log_content=request_ctx.log_content,
             ))
+            compaction_runtime, state_resumable, offers_compaction_tools = (
+                self.select_compaction_runtime(runtime)
+            )
+            compaction_tools = (
+                effective_tools.get_definitions() if offers_compaction_tools else []
+            )
+            no_compaction_tool_calls = not offers_compaction_tools
+            compactor_input_budget = self.consolidator.compactor_input_budget(
+                compaction_runtime, compaction_tools, len(transcript_input.history),
+            )
             result = await self.runner.run(AgentRunSpec(
                 initial_messages=None,
                 tools=effective_tools,
@@ -1306,17 +1392,20 @@ class AgentLoop:
                 ),
                 consolidate_history=partial(
                     self.consolidator.summarize_transcript,
-                    runtime=runtime,
+                    runtime=compaction_runtime,
                     session_key=consolidation_session_key,
-                    tools=effective_tools.get_definitions(),
+                    tools=compaction_tools,
+                    no_tool_contract=no_compaction_tool_calls,
                     persist=session is not None and not ephemeral,
                 ),
                 consolidate_provider_compaction=partial(
                     self.consolidator.summarize_provider_compaction,
-                    runtime=runtime,
+                    runtime=compaction_runtime,
                     session_key=consolidation_session_key,
-                    tools=effective_tools.get_definitions(),
+                    tools=compaction_tools,
+                    no_tool_contract=no_compaction_tool_calls,
                     persist=session is not None and not ephemeral,
+                    allow_provider_state=state_resumable,
                 ),
                 injection_callback=pending_inputs.drain if pending_inputs is not None else None,
                 terminal_injection_callback=(
@@ -1332,6 +1421,7 @@ class AgentLoop:
                     metadata=request_metadata,
                 ),
                 events=events,
+                compactor_input_budget=compactor_input_budget,
             ))
         if session is not None and retain_session_state:
             session.provider_state = result.provider_state
@@ -1373,7 +1463,7 @@ class AgentLoop:
             with self.bus.admission.activity():
                 await self.auto_compact.check_expired(
                     self.schedule_background,
-                    self.runtime_for_session,
+                    self.compaction_runtime_for_session,
                     active_session_keys=self._pending_queues.keys(),
                 )
         except SessionOperationQueueFullError:
@@ -2409,16 +2499,20 @@ class AgentLoop:
         message_count: int,
         session_key: str,
     ) -> int | None:
-        """Return a checkpoint boundary only when it belongs to this turn."""
+        """Return a checkpoint boundary only when it belongs to this turn.
+
+        A boundary may sit inside the turn's persisted history (a
+        prefix-cut compaction) or at/after the save window; index 0 is the
+        transcript's system message, which is never persisted.
+        """
         if checkpoint is None:
             return None
         boundary = checkpoint.transcript_boundary
-        if skip - 1 <= boundary <= message_count:
+        if 1 <= boundary <= message_count:
             return boundary
         logger.warning(
-            "Ignoring invalid summary boundary {} outside [{}, {}] for {}",
+            "Ignoring invalid summary boundary {} outside [1, {}] for {}",
             boundary,
-            skip - 1,
             message_count,
             session_key,
         )
@@ -2458,14 +2552,23 @@ class AgentLoop:
             session_key=session.key,
         )
 
-        # The trigger input may already be the session tail while still being
-        # the first message after the replacement checkpoint.
-        if summary_checkpoint is not None and checkpoint_boundary == skip - 1:
-            insert_at = len(session.messages) - (1 if input_persisted_early else 0)
-            session.commit_summary_checkpoint(
-                summary_checkpoint.summary,
-                insert_at=insert_at,
-            )
+        # A boundary before this turn's save window maps into the session
+        # tail already persisted for the turn. The trigger input may already
+        # be the session tail while still being the first message after the
+        # replacement checkpoint; a prefix-cut compaction stops the summary
+        # earlier, inside the persisted history.
+        if summary_checkpoint is not None and checkpoint_boundary < skip:
+            if checkpoint_boundary == skip - 1 and input_persisted_early:
+                insert_at = len(session.messages) - 1
+            else:
+                insert_at = session.message_index_at_history_position(
+                    checkpoint_boundary - 1,
+                )
+            if insert_at is not None:
+                session.commit_summary_checkpoint(
+                    summary_checkpoint.summary,
+                    insert_at=insert_at,
+                )
 
         for message_index, message in enumerate(messages[skip:], start=skip):
             # Insert against the raw transcript index before filtering the

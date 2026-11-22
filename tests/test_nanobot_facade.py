@@ -1959,21 +1959,29 @@ async def test_runtime_helpers_expose_model_workspace_and_compact(tmp_path):
     bot._loop.consolidator.compact_idle_session = compact_session
     snapshot = await bot.runtime.compact_session("sdk:history")
     assert snapshot.key == "sdk:history"
-    compact_session.assert_awaited_once_with(
-        "sdk:history",
-        runtime=runtime,
-    )
+    compact_session.assert_awaited_once()
+    assert compact_session.await_args.args == ("sdk:history",)
+    assert compact_session.await_args.kwargs["runtime"] is runtime
+    # No compactor configured: the legacy session-tool registry is offered
+    # and the request keeps its existing shape (no no-tools contract).
+    assert compact_session.await_args.kwargs["tools"] == bot._loop.tools.get_definitions()
+    assert compact_session.await_args.kwargs["no_tool_contract"] is False
     assert bot.runtime.model == bot._loop.model
     assert bot.runtime.workspace == tmp_path
 
     bot._loop.consolidator.compact_idle_session = AsyncMock(return_value="Summary.")
     summary = await bot.runtime.compact_idle_session("sdk:history", max_suffix=4)
     assert summary == "Summary."
-    bot._loop.consolidator.compact_idle_session.assert_awaited_once_with(
-        "sdk:history",
-        runtime=runtime,
-        max_suffix=4,
-    )
+    kwargs = bot._loop.consolidator.compact_idle_session.await_args.kwargs
+    replay = kwargs.pop("replay_config")
+    assert replay.model == runtime.model
+    assert replay.context_window_tokens == runtime.context_window_tokens
+    assert kwargs == {
+        "runtime": runtime,
+        "tools": bot._loop.tools.get_definitions(),
+        "no_tool_contract": False,
+        "max_suffix": 4,
+    }
 
 
 @pytest.mark.asyncio

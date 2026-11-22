@@ -24,7 +24,7 @@ def _runtime(_session: Session | None = None):
 
 
 async def _resolve_runtime(session: Session):
-    return _runtime(session)
+    return _runtime(session), [], False, None
 
 
 def _make_session(
@@ -229,17 +229,21 @@ class TestCheckExpired:
         ac.sessions.get_or_create.return_value = session
         admitted = _runtime()
         replacement = _runtime()
-        resolve_runtime = AsyncMock(return_value=admitted)
+        replay_config = MagicMock(name="replay_config")
+        resolve_runtime = AsyncMock(return_value=(admitted, [], False, replay_config))
         scheduled = []
 
         await ac.check_expired(scheduled.append, resolve_runtime)
-        resolve_runtime.return_value = replacement
+        resolve_runtime.return_value = (replacement, [], False, None)
         await scheduled[0]
 
         resolve_runtime.assert_called_once_with(session)
         ac.consolidator.compact_idle_session.assert_awaited_once_with(
             "cli:old",
             runtime=admitted,
+            tools=[],
+            no_tool_contract=False,
+            replay_config=replay_config,
             events=NO_EVENTS,
             reason="idle",
         )
@@ -264,7 +268,7 @@ class TestCheckExpired:
         async def resolve_runtime(session: Session):
             if session.key == "cli:removed":
                 raise resolution_error("model preset cannot be resolved")
-            return healthy_runtime
+            return healthy_runtime, [], False, None
 
         scheduled = []
 
@@ -389,6 +393,9 @@ class TestArchiveDelegates:
         ac.consolidator.compact_idle_session.assert_awaited_once_with(
             "cli:test",
             runtime=runtime,
+            tools=None,
+            no_tool_contract=False,
+            replay_config=None,
             events=NO_EVENTS,
             reason="idle",
         )

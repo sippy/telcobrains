@@ -329,6 +329,118 @@ class TestBuildResponsesBodyExtraBody:
         ]
 
 
+class TestNoToolChoiceContract:
+    """``tool_choice='none'`` must survive the configured extra_body merge.
+
+    A tool-free summarization request (configured compactor) says 'no tools'
+    explicitly. The configured ``extra_body`` is merged on top of the request,
+    so it can carry ``tools`` and ``tool_choice``; the adapter must enforce
+    the contract after that merge so the request stays tool-free.
+    """
+
+    _MANAGED = {"type": "web_search"}
+
+    def test_chat_tool_free_request_drops_configured_tools(self) -> None:
+        provider = _make_provider({"tools": [self._MANAGED], "tool_choice": "auto"})
+        kwargs = provider._build_kwargs(
+            messages=_simple_messages(),
+            tools=[], model=None, max_tokens=100,
+            temperature=0.1, reasoning_effort=None, tool_choice="none",
+        )
+        # No tools, and no tool_choice either: strict endpoints reject a
+        # tool_choice without tools, and the request must stay tool-free.
+        assert "tools" not in kwargs
+        assert "tool_choice" not in kwargs
+        assert kwargs.get("extra_body", {}).get("tool_choice") is None
+
+    def test_chat_tool_free_request_with_none_tools(self) -> None:
+        provider = _make_provider({"tools": [self._MANAGED], "tool_choice": "auto"})
+        kwargs = provider._build_kwargs(
+            messages=_simple_messages(),
+            tools=None, model=None, max_tokens=100,
+            temperature=0.1, reasoning_effort=None, tool_choice="none",
+        )
+        assert "tools" not in kwargs
+        assert "tool_choice" not in kwargs
+
+    def test_chat_none_with_tools_forbids_calls_but_keeps_schemas(self) -> None:
+        function_tool = {
+            "type": "function",
+            "function": {
+                "name": "write_file",
+                "description": "Write a local file",
+                "parameters": {"type": "object"},
+            },
+        }
+        provider = _make_provider({"tools": [self._MANAGED], "tool_choice": "auto"})
+        kwargs = provider._build_kwargs(
+            messages=_simple_messages(),
+            tools=[function_tool], model=None, max_tokens=100,
+            temperature=0.1, reasoning_effort=None, tool_choice="none",
+        )
+        # Schemas stay (managed tools included); calls are forbidden.
+        assert kwargs["tools"] == [function_tool, self._MANAGED]
+        assert kwargs["tool_choice"] == "none"
+        assert kwargs.get("extra_body", {}).get("tool_choice") is None
+
+    def test_chat_ordinary_request_ignores_contract(self) -> None:
+        """Default unchanged: without the contract, configured tools/choice keep merging."""
+        provider = _make_provider({"tools": [self._MANAGED], "tool_choice": "auto"})
+        kwargs = provider._build_kwargs(
+            messages=_simple_messages(),
+            tools=[], model=None, max_tokens=100,
+            temperature=0.1, reasoning_effort=None, tool_choice=None,
+        )
+        assert kwargs["tools"] == [self._MANAGED]
+
+    def test_responses_tool_free_request_drops_configured_tools(self) -> None:
+        provider = OpenAICompatProvider(
+            api_key="test-key",
+            default_model="gpt-5",
+            spec=find_by_name("openai"),
+            extra_body={"tools": [{"type": "web_search"}], "tool_choice": "auto"},
+        )
+        body = provider._build_responses_body(
+            messages=_simple_messages(),
+            tools=[], model=None, max_tokens=100,
+            temperature=0.1, reasoning_effort=None, tool_choice="none",
+        )
+        assert "tools" not in body
+        assert "tool_choice" not in body
+
+    def test_responses_none_with_tools_forbids_calls_but_keeps_schemas(self) -> None:
+        provider = OpenAICompatProvider(
+            api_key="test-key",
+            default_model="gpt-5",
+            spec=find_by_name("openai"),
+            extra_body={"tools": [{"type": "web_search"}], "tool_choice": "auto"},
+        )
+        body = provider._build_responses_body(
+            messages=_simple_messages(),
+            tools=[{
+                "type": "function",
+                "function": {
+                    "name": "read_file",
+                    "description": "Read a file",
+                    "parameters": {"type": "object"},
+                },
+            }],
+            model=None, max_tokens=100, temperature=0.1,
+            reasoning_effort=None, tool_choice="none",
+        )
+        assert body["tools"] == [
+            {
+                "type": "function",
+                "name": "read_file",
+                "description": "Read a file",
+                "parameters": {"type": "object"},
+                "strict": False,
+            },
+            {"type": "web_search"},
+        ]
+        assert body["tool_choice"] == "none"
+
+
 class TestSchemaConfig:
 
     def test_default_is_none(self) -> None:

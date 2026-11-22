@@ -551,6 +551,18 @@
         "agents_defaults_max_tool_result_chars": {"label": "Longitud del resultado", "help": "Límite de caracteres por resultado de herramienta enviado al modelo.\n\nLimita la salida de las herramientas incluida en el contexto del modelo."},
         "agents_defaults_provider_retry_mode": {"label": "Seguir reintentando", "help": "Reintenta errores recuperables; desactívalo para usar reintentos estándar.\n\nVuelve a intentar las solicitudes al modelo tras un error temporal. Desactiva esta opción para limitar el número de reintentos."},
         "agents_defaults_tool_hint_max_length": {"label": "Longitud del resumen", "help": "Límite de caracteres de los resúmenes de herramientas.\n\nLongitud máxima de las indicaciones breves de actividad."},
+        "agents_defaults_compactor_model_override": {
+          "label": "Modelo de compactación",
+          "help": "Ajuste predefinido de modelo que resume el contexto compactado. La conversación mantiene su propio modelo.\n\nDéjalo sin definir para compactar con el modelo activo de la conversación."
+        },
+        "agents_defaults_compactor_next_turn_input_reserve_tokens": {
+          "label": "Reserva de entrada del siguiente turno",
+          "help": "Tokens de entrada que quedan libres tras una compactación de sesión (inactividad, manual o SDK) para que el siguiente mensaje quepa sin volver a compactar.\n\n0 mantiene el comportamiento actual. Una reserva mayor deja menos historial reciente literal."
+        },
+        "agents_defaults_compactor_min_verbatim_tail_tokens": {
+          "label": "Cola literal mínima",
+          "help": "Tokens mínimos de historial reciente que conservar literalmente tras una compactación de sesión (inactividad, manual o SDK). Solo cuenta la cola reproducible: nunca el resumen, el prompt ni la entrada nueva.\n\n0 desactiva el límite y mantiene el relleno de prefijo completo. Si una sesión no puede conservar tanto, se omite en lugar de compactarla más. La compactación de primer plano sigue compactando para ajustar la ventana."
+        },
         "tools_max_session_messages_per_minute": {"label": "Frecuencia de mensajes", "help": "Máximo de mensajes de herramientas a una sesión por minuto.\n\nLimita la frecuencia de los mensajes que envían las herramientas a una conversación."},
         "tools_exec_enable": {"label": "Herramienta de shell", "help": "Permite al agente ejecutar comandos Shell.\n\nPermite al agente ejecutar comandos de shell."},
         "tools_file_enable": {"label": "Herramientas de archivos", "help": "Permite las herramientas integradas de lectura y edición de archivos."},

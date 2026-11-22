@@ -199,6 +199,48 @@ class Session:
         """Return the replayable context for archives and estimates without loading images."""
         return self._history(max_tokens=max_tokens, view="text" if include_runtime_context else "public")
 
+    def message_index_at_history_position(self, position: int) -> int | None:
+        """Raw index of the message at position *position* of ``get_history()``.
+
+        The scan applies the same trims and skips as the model-facing history
+        (head alignment to the first user turn, legal tool-pair start, command
+        and summary-checkpoint messages, empty assistant turns), so a position
+        in the model-facing transcript maps to the exact persisted message
+        that produced it. Valid for the default ``get_history()`` call (no
+        ``max_messages`` / ``max_tokens`` trimming); returns None when the
+        position falls outside the replayable tail.
+        """
+        if position < 0:
+            return None
+        replayable = self.messages[self.last_archived:]
+        start = 0
+        for i, message in enumerate(replayable):
+            if message.get("role") == "user":
+                start = i
+                if i > 0 and replayable[i - 1].get("_channel_delivery"):
+                    start = i - 1
+                break
+        start += find_legal_message_start(replayable[start:])
+        seen = 0
+        for offset, message in enumerate(replayable[start:], start=start):
+            if message.get("_command") or is_summary_checkpoint(message):
+                continue
+            content = message.get("content")
+            if (
+                message.get("role") == "assistant"
+                and isinstance(content, str)
+                and not content.strip()
+                and not any(
+                    key in message
+                    for key in ("tool_calls", "reasoning_content", "thinking_blocks")
+                )
+            ):
+                continue
+            if seen == position:
+                return self.last_archived + offset
+            seen += 1
+        return None
+
     def _history(
         self, max_messages: int = 0, *, max_tokens: int = 0, extend_to_user: bool = False,
         view: Literal["model", "text", "public"],

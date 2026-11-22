@@ -121,6 +121,6 @@ To change how often Dream runs or pick a dedicated model preset for it, configur
 | `cron` | Optional cron expression override (takes precedence over `intervalH`, e.g. `"0 */4 * * *"`) |
 | `modelOverride` | Optional named model preset from `modelPresets` to use for Dream |
 
-To adjust automatic idle compaction, see [Auto Compact](./configuration.md#auto-compact). To show automatic compaction notices in chat apps (hidden by default; manual `/compact` always shows feedback), set `channels.showCompactionNotices: true`.
+To adjust automatic idle compaction, see [Auto Compact](./configuration.md#auto-compact). To route compaction summarization to a dedicated model preset, see [Compactor](./configuration.md#compactor). To show automatic compaction notices in chat apps (hidden by default; manual `/compact` always shows feedback), set `channels.showCompactionNotices: true`.
 
 </details>

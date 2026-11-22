@@ -60,7 +60,7 @@ async def schedule_idle_archive(bot):
     with patch("nanobot.agent.autocompact.datetime") as clock:
         clock.now.return_value = datetime.now() + timedelta(minutes=30)
         clock.fromisoformat.side_effect = datetime.fromisoformat
-        await bot._loop.auto_compact.check_expired(scheduled.append, bot._loop.runtime_for_session)
+        await bot._loop.auto_compact.check_expired(scheduled.append, bot._loop.compaction_runtime_for_session)
     assert len(scheduled) == 1
     return scheduled[0]
 
@@ -125,7 +125,7 @@ async def test_compaction_waits_for_active_sdk_turn_and_preserves_reply(
                 clock.now.return_value = datetime.now() + timedelta(minutes=30)
                 clock.fromisoformat.side_effect = datetime.fromisoformat
                 await bot._loop.auto_compact.check_expired(
-                    scheduled.append, bot._loop.runtime_for_session,
+                    scheduled.append, bot._loop.compaction_runtime_for_session,
                     active_session_keys={"sdk:other"},
                 )
                 assert len(scheduled) == 1
@@ -138,7 +138,10 @@ async def test_compaction_waits_for_active_sdk_turn_and_preserves_reply(
 
         await assert_reply_and_summary(bot, key)
         assert summary_started_during_turn is False
-        assert {"role": "assistant", "content": "new reply"} in provider.summary_messages
+        assert {"role": "assistant", "content": "old reply"} in provider.summary_messages
+        assert {"role": "assistant", "content": "new reply"} not in provider.summary_messages
+        session = await bot._loop.sessions.state.get(key)
+        assert session.get_history()[-1] == {"role": "assistant", "content": "new reply"}
         if trigger == "compact_session":
             assert compacted.metadata["_last_summary"]["text"] == "Shared transcript summary."
             assert any(message["content"] == "new reply" for message in compacted.messages)

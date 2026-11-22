@@ -98,6 +98,34 @@ class DreamConfig(Base):
         return f"every {hours}h"
 
 
+class CompactorConfig(Base):
+    """Model override for compaction and consolidation calls."""
+
+    model_override: str | None = Field(
+        default=None,
+        validation_alias=AliasChoices("modelOverride", "model", "model_override"),
+    )
+    next_turn_input_reserve_tokens: int = Field(
+        default=0,
+        ge=0,
+        validation_alias=AliasChoices(
+            "nextTurnInputReserveTokens", "next_turn_input_reserve_tokens",
+        ),
+    )
+    # Minimum of recent verbatim history to retain after session compaction.
+    # The floor counts only the replayable raw tail, never the summary, prompt,
+    # or fresh delta. ``0`` disables it and keeps the legacy full-prefix
+    # fallback.
+    min_verbatim_tail_tokens: int = Field(
+        default=90_000,
+        ge=0,
+        strict=True,
+        validation_alias=AliasChoices(
+            "minVerbatimTailTokens", "min_verbatim_tail_tokens",
+        ),
+    )
+
+
 class ProviderAPIConfig(Base):
     """Connection API defaults and custom endpoints' accepted request APIs."""
 
@@ -217,6 +245,7 @@ class AgentDefaults(Base):
         ge=0,
     )
     dream: DreamConfig = Field(default_factory=DreamConfig)
+    compactor: CompactorConfig = Field(default_factory=CompactorConfig)
 
     @model_validator(mode="before")
     @classmethod
@@ -556,6 +585,9 @@ class Config(BaseSettings):
         dream_name = self.agents.defaults.dream.model_override
         if dream_name and dream_name != "default" and dream_name not in self.model_presets:
             raise ValueError(f"Dream model preset {dream_name!r} not found in model_presets")
+        compactor_name = self.agents.defaults.compactor.model_override
+        if compactor_name and compactor_name not in self.model_presets:
+            raise ValueError(f"Compactor model preset {compactor_name!r} not found in model_presets")
         for fallback in self.agents.defaults.fallback_models:
             if isinstance(fallback, str) and fallback not in self.model_presets:
                 raise ValueError(f"fallback_models entry {fallback!r} not found in model_presets")

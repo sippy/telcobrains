@@ -71,6 +71,17 @@ describe("Idle compaction settings", () => {
     await user.click(input());
     await user.clear(input());
     await user.type(input(), "37");
+    // Compaction model, next-turn reserve, and min-tail controls sit between
+    // the idle timeout and the group footer (each title carries a help button).
+    await user.tab();
+    await user.tab();
+    expect(screen.getByRole("combobox", { name: "Compaction model" })).toHaveFocus();
+    await user.tab();
+    await user.tab();
+    expect(screen.getByRole("spinbutton", { name: "Next-turn input reserve" })).toHaveFocus();
+    await user.tab();
+    await user.tab();
+    expect(screen.getByRole("spinbutton", { name: "Min. verbatim tail" })).toHaveFocus();
     await user.tab();
     expect(screen.getByRole("button", { name: "Cancel" })).toHaveFocus();
     expect(requestMutationMock).not.toHaveBeenCalled();

@@ -551,6 +551,18 @@
         "agents_defaults_max_tool_result_chars": {"label": "結果長度", "help": "每條工具結果傳給模型的字元上限\n\n限制每條工具結果傳入模型的長度，按字元計數。"},
         "agents_defaults_provider_retry_mode": {"label": "持續重試", "help": "可恢復錯誤持續重試；關閉用標準策略\n\n遇到可恢復的請求錯誤時持續重試。關閉後使用標準重試策略。"},
         "agents_defaults_tool_hint_max_length": {"label": "提示長度", "help": "工具執行提示的字元數上限\n\n工具執行時顯示的簡短提示最多包含多少個字元。"},
+        "agents_defaults_compactor_model_override": {
+          "label": "壓縮模型",
+          "help": "用於摘要壓縮上下文的模型預設。對話仍使用自己的模型。\n\n留空時使用對話目前模型壓縮。"
+        },
+        "agents_defaults_compactor_next_turn_input_reserve_tokens": {
+          "label": "輸入預留",
+          "help": "閒置、手動或 SDK 對話壓縮後保留的輸入 token，讓下一則訊息無需再次壓縮即可放入。\n\n0 保持目前行為。預留越大，逐字保留的近期歷史越少。"
+        },
+        "agents_defaults_compactor_min_verbatim_tail_tokens": {
+          "label": "最小逐字尾",
+          "help": "空閒、手動或 SDK 會話壓縮後逐字保留的近期歷史最少 token 數。只統計可回放的尾部——摘要、提示詞與新增輸入均不計入。\n\n0 關閉下限，保持舊的整段歸檔回退。若會話無法保留這麼多，將跳過而非壓縮得更少。前景壓縮仍會壓縮以適配視窗。"
+        },
         "tools_max_session_messages_per_minute": {"label": "訊息頻率", "help": "工具每分鐘向同一會話發訊息的上限"},
         "tools_exec_enable": {"label": "Shell 工具", "help": "允許智慧體執行 Shell 命令"},
         "tools_file_enable": {"label": "檔案工具", "help": "允許使用內建檔案讀取和編輯工具"},

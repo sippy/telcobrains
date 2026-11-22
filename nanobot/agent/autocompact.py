@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING, Any, Callable, Coroutine
 
 from loguru import logger
 
+from nanobot.agent.memory import min_tail_skip_marker
 from nanobot.events import NO_EVENTS, EventSink
 from nanobot.session.keys import is_dream_session
 from nanobot.session.manager import Session, SessionManager
@@ -16,6 +17,7 @@ from nanobot.session.summary import (
 )
 
 if TYPE_CHECKING:
+    from nanobot.agent.context_governance import ContextGovernanceConfig
     from nanobot.agent.memory import Consolidator
     from nanobot.utils.llm_runtime import LLMRuntime
 
@@ -62,10 +64,32 @@ class AutoCompact:
             return False
         return idle_seconds >= self._ttl * 60
 
+    @staticmethod
+    def _already_compacted(session: Session) -> bool:
+        # A protected suffix is still unarchived, but it is not new activity.
+        summary = session_summary_from_metadata(
+            session.metadata, fallback_last_active=session.created_at,
+        )
+        return summary is not None and summary["last_active"] == session.updated_at.isoformat()
+
+    @staticmethod
+    def _floor_already_blocked(
+        session: Session, runtime: LLMRuntime, replay: ContextGovernanceConfig | None,
+    ) -> bool:
+        marker = session.metadata.get("_min_tail_skip")
+        return (
+            isinstance(marker, list)
+            and replay is not None
+            and replay.min_verbatim_tail_tokens > 0
+            and marker == min_tail_skip_marker(session, runtime, replay)
+        )
+
     async def check_expired(
         self,
         schedule_background: Callable[[Coroutine[Any, Any, None]], None],
-        resolve_runtime: Callable[[Session], Awaitable[LLMRuntime]],
+        resolve_runtime: Callable[
+            [Session], Awaitable[tuple[LLMRuntime, list[dict[str, Any]], bool, ContextGovernanceConfig]]
+        ],
         active_session_keys: Collection[str] = (),
     ) -> None:
         """Schedule idle archival without blocking the event loop."""
@@ -86,15 +110,33 @@ class AutoCompact:
                 continue
             if not await self.sessions.state.has_unarchived_messages(key):
                 continue
-            session = await self.sessions.state.get(key)
+            session = await self.sessions.state.get_header(key)
+            if self._already_compacted(session):
+                continue
             try:
-                runtime = await resolve_runtime(session)
+                runtime, tools, no_tool_contract, replay_config = await resolve_runtime(session)
             except (KeyError, ValueError):
                 continue
+            if self._floor_already_blocked(session, runtime, replay_config):
+                continue
             self._archiving.add(key)
-            schedule_background(self._archive(key, runtime=runtime))
+            schedule_background(self._archive(
+                key,
+                runtime=runtime,
+                tools=tools,
+                no_tool_contract=no_tool_contract,
+                replay_config=replay_config,
+            ))
 
-    async def _archive(self, key: str, *, runtime: LLMRuntime) -> None:
+    async def _archive(
+        self,
+        key: str,
+        *,
+        runtime: LLMRuntime,
+        tools: list[dict[str, Any]] | None = None,
+        no_tool_contract: bool = False,
+        replay_config: ContextGovernanceConfig | None = None,
+    ) -> None:
         if is_dream_session(key):
             self._archiving.discard(key)
             return
@@ -102,12 +144,19 @@ class AutoCompact:
             async with self._session_lock(key):
                 # A turn may have refreshed activity while this archive waited.
                 session = await self.sessions.state.get_header(key)
-                if not self._is_expired(session.updated_at):
+                if (
+                    not self._is_expired(session.updated_at)
+                    or self._already_compacted(session)
+                    or self._floor_already_blocked(session, runtime, replay_config)
+                ):
                     return
                 # Idle compaction and turns share one transcript boundary.
                 summary = await self.consolidator.compact_idle_session(
                     key,
                     runtime=runtime,
+                    tools=tools,
+                    no_tool_contract=no_tool_contract,
+                    replay_config=replay_config,
                     events=self._bind_events(key) if self._bind_events else NO_EVENTS,
                     reason="idle",
                 )

@@ -43,7 +43,7 @@ from nanobot.providers.base import (
 from nanobot.providers.compaction import ProviderStateCommitError
 from nanobot.providers.conversation_state import ProviderConversationStateController
 from nanobot.session.history_visibility import HIDDEN_HISTORY_META, is_hidden_history_message
-from nanobot.session.summary import SessionSummaryCheckpoint
+from nanobot.session.summary import CompactorInputBudget, SessionSummaryCheckpoint
 from nanobot.utils.cancellation import shield_and_drain
 from nanobot.utils.helpers import (
     build_assistant_message,
@@ -140,6 +140,10 @@ class AgentRunSpec:
     provider_state: ProviderConversationState | None = None
     llm_usage_source: LLMUsageSource | None = None
     events: EventSink = NO_EVENTS
+    # Actual input capacity of the history consolidator; enables oldest-prefix
+    # cut selection on the local context-pressure path. None keeps the
+    # full-prefix compaction behavior.
+    compactor_input_budget: CompactorInputBudget | None = None
 
 
 @dataclass(slots=True)
@@ -387,6 +391,7 @@ class AgentRunner:
                 transcript_builder,
                 consolidate_history,
                 spec.consolidate_provider_compaction,
+                compactor_input_budget=spec.compactor_input_budget,
             )
         if spec.initial_messages is None:
             raise ValueError("initial_messages is required without transcript_input")
@@ -395,6 +400,7 @@ class AgentRunner:
             messages,
             consolidate_history,
             spec.consolidate_provider_compaction,
+            compactor_input_budget=spec.compactor_input_budget,
         )
 
     async def _run_core(

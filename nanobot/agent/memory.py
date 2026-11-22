@@ -18,6 +18,7 @@ from uuid import uuid4
 
 from loguru import logger
 
+from nanobot.agent.context_governance import ContextGovernanceConfig, ContextGovernor
 from nanobot.config.paths import DREAM_CURSOR_PATH, MEMORY_CURSOR_PATH, MEMORY_JOURNAL_PATH
 from nanobot.events import NO_EVENTS, CompactionReason, ContextCompactionEvent, EventSink
 from nanobot.llm_usage.context import llm_usage_source
@@ -26,7 +27,11 @@ from nanobot.providers.conversation_state import ProviderConversationStateContro
 from nanobot.runtime_context import public_history_messages
 from nanobot.session.manager import Session, SessionManager
 from nanobot.session.message_content import history_message_text
-from nanobot.session.summary import is_summary_checkpoint, session_summary_from_metadata
+from nanobot.session.summary import (
+    CompactorInputBudget,
+    is_summary_checkpoint,
+    session_summary_from_metadata,
+)
 from nanobot.utils.gitstore import MEMORY_CONTENT_PATHS, MEMORY_WIKI_PATH, GitStore
 from nanobot.utils.helpers import (
     atomic_write_lines,
@@ -714,6 +719,12 @@ _ARCHIVE_TOOL_RESULT = (
 )
 
 
+def _archive_prompt(archive_count: int) -> dict[str, str]:
+    return {"role": "user", "content": render_template(
+        "agent/consolidator_archive.md", strip=True, archive_count=archive_count,
+    )}
+
+
 class MemoryArchiver:
     """Generate transcript checkpoints and optionally journal their source.
 
@@ -798,9 +809,18 @@ class MemoryArchiver:
         input_token_budget: int | None = None,
         fallback_max_tokens: int | None = None,
         provider_state: ProviderConversationState | None = None,
+        no_tool_contract: bool = False,
         persist: bool = True,
     ) -> str | None:
-        """Generate a replacement checkpoint and optionally persist it."""
+        """Generate a replacement checkpoint and optionally persist it.
+
+        ``no_tool_contract`` marks a configured-compactor request: its
+        summarization must be tool-free in every request shape (full
+        transcript replay or native-state replay), and adapters are told so
+        with an explicit ``tool_choice='none'`` that survives configured
+        ``extra_body`` merges. Legacy no-override compaction keeps its
+        existing request shape, including an empty session tool registry.
+        """
         if not source_messages:
             return None
 
@@ -817,12 +837,7 @@ class MemoryArchiver:
                 persist=persist,
             )
 
-        prompt = render_template(
-            "agent/consolidator_archive.md",
-            strip=True,
-            archive_count=len(source_messages),
-        )
-        prompt_message = {"role": "user", "content": prompt}
+        prompt_message = _archive_prompt(len(source_messages))
         provider_context = None
         state_controller: ProviderConversationStateController | None = None
         state_messages: list[dict[str, Any]] = []
@@ -883,6 +898,14 @@ class MemoryArchiver:
                         temperature=runtime.generation.temperature,
                         max_tokens=runtime.generation.max_tokens,
                         reasoning_effort=runtime.generation.reasoning_effort,
+                        # A configured compactor summarizes without tools in
+                        # every request shape, including native-state replay
+                        # (provider state persists items, not tool schemas, so
+                        # a tool-free request still replays). The explicit
+                        # contract tells adapters to keep the request tool-free
+                        # even when a configured extra_body would merge tools
+                        # or tool_choice into it.
+                        tool_choice="none" if no_tool_contract else None,
                         provider_context=provider_context,
                     )
             except Exception:
@@ -892,7 +915,11 @@ class MemoryArchiver:
                     phase,
                 )
                 return raw_fallback()
-            if response.should_execute_tools is not True or attempt == 1:
+            if response.should_execute_tools is not True or attempt == 1 or not request_tools:
+                # Tool-free requests (a configured compactor, or a session
+                # without tools) never recover: echoing an unsolicited
+                # tool-call transcript back only risks another call, and the
+                # raw checkpoint below preserves the full evidence.
                 break
 
             logger.info(
@@ -968,8 +995,16 @@ class MemoryArchiver:
         archive_end: int,
         runtime: LLMRuntime,
         input_token_budget: int,
+        tools: list[dict[str, Any]] | None = None,
+        no_tool_contract: bool = False,
     ) -> str | None:
-        """Archive a captured session prefix without mutating the session."""
+        """Archive a captured session prefix without mutating the session.
+
+        ``tools`` is the tool set offered with the summarization request.
+        ``None`` keeps the legacy registry defaults; a configured compactor
+        passes ``[]`` (with ``no_tool_contract``) so the request offers no
+        tool calls at all.
+        """
         messages = [
             message for message in session.messages[session.last_archived:archive_end]
             if not message.get("_command") and not is_summary_checkpoint(message)
@@ -1025,16 +1060,29 @@ class MemoryArchiver:
             session_summary=session_summary,
             workspace=workspace,
         )
-        tools = self._get_tool_definitions()
+        request_tools = self._get_tool_definitions() if tools is None else tools
         return await self.archive(
             messages,
             runtime=runtime,
             session_key=session.key,
             history=history_messages,
-            request_tools=tools,
+            request_tools=request_tools,
             previous_summary=previous_summary,
             input_token_budget=input_token_budget,
+            no_tool_contract=no_tool_contract,
         )
+
+
+def min_tail_skip_marker(
+    session: Session, runtime: LLMRuntime, replay: ContextGovernanceConfig,
+) -> list[str | int | None]:
+    """Key a skipped cut to its replay boundary and session sizing policy."""
+    return [
+        session.updated_at.isoformat(), session.last_archived,
+        replay.min_verbatim_tail_tokens, replay.next_turn_input_reserve_tokens,
+        replay.model, replay.context_window_tokens, replay.max_tokens,
+        runtime.model, runtime.context_window_tokens, runtime.generation.max_tokens,
+    ]
 
 
 class Consolidator:
@@ -1053,7 +1101,9 @@ class Consolidator:
         self.store = store
         self.sessions = sessions
         self._build_messages = build_messages
+        self._resolve_prompt_context = resolve_prompt_context
         self._get_tool_definitions = get_tool_definitions
+        self._context_governor = ContextGovernor()
         self.archiver = MemoryArchiver(
             store=store,
             build_messages=build_messages,
@@ -1068,6 +1118,46 @@ class Consolidator:
         """Return the shared consolidation lock for one session."""
         return self._locks.setdefault(session_key, asyncio.Lock())
 
+    def compactor_input_budget(
+        self,
+        runtime: LLMRuntime,
+        tools: list[dict[str, Any]] | None,
+        archive_count: int,
+    ) -> CompactorInputBudget | None:
+        """Describe the consolidator's actual input capacity for a transcript prefix.
+
+        Mirrors ``summarize_transcript``: the compactor's window minus its
+        reserved output, minus the summarization prompt and offered tools.
+        ``None`` means no positive capacity can be derived, so callers keep
+        the full-prefix compaction behavior.
+        """
+        max_output_tokens = runtime.generation.max_tokens
+        context_window = runtime.context_window_tokens
+        if (
+            isinstance(max_output_tokens, bool)
+            or not isinstance(max_output_tokens, int)
+            or isinstance(context_window, bool)
+            or not isinstance(context_window, int)
+        ):
+            return None
+        input_budget = context_window - max(0, max_output_tokens)
+        if input_budget <= 0:
+            return None
+        request_tools = self._get_tool_definitions() if tools is None else tools
+        overhead, _ = estimate_prompt_tokens_chain(
+            runtime.provider,
+            runtime.model,
+            [_archive_prompt(max(0, archive_count))],
+            request_tools,
+        )
+        if input_budget - overhead <= 0:
+            return None
+        return CompactorInputBudget(
+            input_budget=input_budget,
+            fixed_overhead_tokens=overhead,
+            max_summary_tokens=max_output_tokens,
+        )
+
     async def summarize_transcript(
         self,
         accepted_messages: list[dict[str, Any]],
@@ -1077,6 +1167,7 @@ class Consolidator:
         session_key: str,
         tools: list[dict[str, Any]],
         provider_state: ProviderConversationState | None = None,
+        no_tool_contract: bool = False,
         persist: bool = True,
     ) -> str | None:
         """Summarize the exact transcript prefix already accepted by the model."""
@@ -1105,6 +1196,7 @@ class Consolidator:
             input_token_budget=input_token_budget,
             fallback_max_tokens=max(1, checkpoint_tokens),
             provider_state=provider_state,
+            no_tool_contract=no_tool_contract,
             persist=persist,
         )
         if summary is None:
@@ -1121,15 +1213,24 @@ class Consolidator:
         session_key: str,
         tools: list[dict[str, Any]],
         persist: bool = True,
+        allow_provider_state: bool = True,
+        no_tool_contract: bool = False,
     ) -> str | None:
-        """Prompt a native compacted state without replaying its raw history."""
+        """Prompt a native compacted state without replaying its raw history.
+
+        ``allow_provider_state`` is ``False`` when *runtime* is a separate
+        provider from the one that produced *state*; the archiver then
+        summarizes the materialized transcript instead of resuming a state it
+        cannot replay.
+        """
         return await self.summarize_transcript(
             fallback_messages,
             previous_summary,
             runtime=runtime,
             session_key=session_key,
             tools=tools,
-            provider_state=state,
+            provider_state=state if allow_provider_state else None,
+            no_tool_contract=no_tool_contract,
             persist=persist,
         )
 
@@ -1172,6 +1273,8 @@ class Consolidator:
         *,
         archive_end: int,
         runtime: LLMRuntime,
+        tools: list[dict[str, Any]] | None = None,
+        no_tool_contract: bool = False,
     ) -> str | None:
         """Archive one captured session range through the shared Memory path."""
         return await self.archiver.archive_session(
@@ -1179,7 +1282,59 @@ class Consolidator:
             archive_end=archive_end,
             runtime=runtime,
             input_token_budget=self._input_token_budget(runtime),
+            tools=tools,
+            no_tool_contract=no_tool_contract,
         )
+
+    def _session_prefix_cut(
+        self,
+        session: Session,
+        config: ContextGovernanceConfig,
+        budget: CompactorInputBudget,
+        previous_summary: str | None,
+        runtime: LLMRuntime,
+        tools: list[dict[str, Any]] | None,
+    ) -> tuple[int, list[dict[str, Any]]] | None:
+        history = session.get_history()
+        channel = session.key.split(":", 1)[0] if ":" in session.key else None
+        workspace = None
+        if self._resolve_prompt_context is not None:
+            channel, workspace = self._resolve_prompt_context(session)
+        wrapper = self._build_messages(
+            history=[], current_message=None, channel=channel, workspace=workspace,
+            session_summary={"text": "", "last_active": session.updated_at.isoformat()},
+        )
+        raw = [*wrapper, *history]
+        cut = self._context_governor.select_prefix_cut(
+            config, raw, len(raw), budget,
+            wrapper, previous_summary, [], config.tools.get_definitions(),
+            replay_starts_at_user=True,
+            next_turn_input_reserve_tokens=config.next_turn_input_reserve_tokens,
+        )
+        if cut is None:
+            return None
+        position = cut - len(wrapper)
+        archive_end = session.message_index_at_history_position(position)
+        assert archive_end is not None  # The cut indexes the same untrimmed replay view.
+        prefix = history[:position]
+        if previous_summary:
+            prefix.insert(0, {
+                "role": "system", "content": f"Previous conversation summary:\n{previous_summary}",
+            })
+        prefix = self._context_governor.prepare_messages_for_model(config, prefix)
+        if config.min_verbatim_tail_tokens > 0:
+            # The selector's additive estimate is a first pass. Verify the
+            # actual compactor prompt before allowing the archiver's fallback.
+            archive_count = sum(message.get("role") != "system" for message in prefix)
+            if not archive_count:
+                return None
+            estimated, _ = estimate_prompt_tokens_chain(
+                runtime.provider, runtime.model, [*prefix, _archive_prompt(archive_count)],
+                self._get_tool_definitions() if tools is None else tools,
+            )
+            if estimated > budget.input_budget:
+                return None
+        return archive_end, prefix
 
     async def compact_idle_session(
         self,
@@ -1187,20 +1342,30 @@ class Consolidator:
         *,
         runtime: LLMRuntime,
         max_suffix: int = 0,
+        tools: list[dict[str, Any]] | None = None,
+        no_tool_contract: bool = False,
+        replay_config: ContextGovernanceConfig | None = None,
         events: EventSink = NO_EVENTS,
         notify: bool = False,
         reason: CompactionReason | None = None,
     ) -> str | None:
-        """Replace archived history with a summary checkpoint.
+        """Replace an old prefix with a summary, retaining a tail when both budgets permit.
 
-        ``max_suffix`` is accepted for SDK compatibility and no longer retains
-        archived messages. All compaction triggers share checkpoint replay.
+        ``max_suffix`` is accepted for SDK compatibility; it does not control
+        the retained tail.
+        ``tools`` overrides the tool set offered to the summarizer; a
+        configured compactor receives ``[]`` (no tool calls offered) with
+        ``no_tool_contract`` set.
         """
         lock = self.get_lock(session_key)
         async with lock:
             await self.sessions.state.discard(session_key)
             session = await self.sessions.state.get(session_key)
 
+            stored_summary = session_summary_from_metadata(
+                session.metadata, fallback_last_active=session.updated_at,
+            )
+            previous_summary = stored_summary["text"] if stored_summary else None
             archive_start = session.last_archived
             messages_to_archive = list(session.messages[archive_start:])
             has_new_messages = any(
@@ -1210,15 +1375,69 @@ class Consolidator:
             if not has_new_messages:
                 return ""
 
+            # Read-only sizing before announcing: resolve the compactor budget and
+            # the protected-tail cut so a floor no-op needs no lifecycle events.
+            # If sizing fails or is cancelled, emit the lifecycle pair before
+            # propagating the error.
             compaction_id = uuid4().hex
-            await events.emit(
-                ContextCompactionEvent(compaction_id=compaction_id, phase="started", notify=notify, reason=reason),
+            started = ContextCompactionEvent(
+                compaction_id=compaction_id, phase="started", notify=notify, reason=reason,
             )
+            try:
+                budget = (
+                    self.compactor_input_budget(runtime, tools, len(messages_to_archive))
+                    if replay_config is not None else None
+                )
+                cut = (
+                    await self._context_governor.prepare_in_background(
+                        self._session_prefix_cut, session, replay_config, budget, previous_summary, runtime, tools,
+                    )
+                    if replay_config is not None and budget is not None else None
+                )
+            except (Exception, asyncio.CancelledError) as exc:
+                await events.emit(started)
+                await events.emit(
+                    ContextCompactionEvent(
+                        compaction_id=compaction_id,
+                        phase="cancelled" if isinstance(exc, asyncio.CancelledError) else "failed",
+                        notify=notify,
+                        reason=reason,
+                    ),
+                )
+                raise
+
+            if replay_config is not None and replay_config.min_verbatim_tail_tokens > 0 and cut is None:
+                # A normal no-op, not a failure or a full-prefix archive.
+                # Remember it for idle scans only while the history and sizing policy match.
+                marker = min_tail_skip_marker(session, runtime, replay_config)
+                if session.metadata.get("_min_tail_skip") != marker:
+                    try:
+                        await self.sessions.state.update_metadata(
+                            session_key, {"_min_tail_skip": marker}, expected_generation=session.generation,
+                        )
+                    except Exception:
+                        logger.debug("Could not record min-tail skip marker for {}", session_key, exc_info=True)
+                logger.info(
+                    "Skipping session compaction for {}: no cut keeps the {}-token verbatim tail",
+                    session_key, replay_config.min_verbatim_tail_tokens,
+                )
+                return ""
+
+            await events.emit(started)
             archive_end = archive_start + len(messages_to_archive)
             try:
-                summary = await self.archive_session(
-                    session, archive_end=archive_end, runtime=runtime,
-                )
+                if cut is None:
+                    summary = await self.archive_session(
+                        session, archive_end=archive_end, runtime=runtime, tools=tools,
+                        no_tool_contract=no_tool_contract,
+                    )
+                else:
+                    archive_end, prefix = cut
+                    summary = await self.summarize_transcript(
+                        prefix, previous_summary, runtime=runtime, session_key=session_key,
+                        tools=self._get_tool_definitions() if tools is None else tools,
+                        no_tool_contract=no_tool_contract,
+                    )
                 if summary:
                     await self.sessions.state.commit_summary(
                         session, summary, archive_end=archive_end,
@@ -1249,10 +1468,10 @@ class Consolidator:
             )
 
             logger.info(
-                "Idle-session compact for {}: archived={}, visible={}, retained={}, summary={}",
+                "Session compact for {}: archived={}, replay_tail={}, retained={}, summary={}",
                 session_key,
-                len(messages_to_archive),
-                len(session.get_text_history()),
+                archive_end - archive_start,
+                len(session.messages) - archive_end,
                 len(session.messages),
                 bool(summary),
             )

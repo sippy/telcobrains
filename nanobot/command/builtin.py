@@ -19,6 +19,7 @@ from nanobot.command.spec import BuiltinCommandSpec
 from nanobot.command.spec import CommandLifecycle as CommandLifecycle
 from nanobot.command.user_shell import cmd_user_shell
 from nanobot.providers.base import LLMUsage
+from nanobot.session.summary import is_summary_checkpoint
 from nanobot.utils.cancellation import shield_and_drain
 from nanobot.utils.gitstore import GitStoreDirtyError
 from nanobot.utils.helpers import build_status_content
@@ -268,25 +269,44 @@ async def cmd_new(ctx: CommandContext) -> OutboundMessage:
     )
 
 
-async def cmd_compact(ctx: CommandContext) -> None:
+async def cmd_compact(ctx: CommandContext) -> OutboundMessage | None:
     """Compact the current session without resetting the conversation."""
     loop = ctx.loop
     session = ctx.session or await loop.sessions.state.get(ctx.key)
-    runtime = ctx.runtime or await loop.runtime_for_session(session)
+    # Explicit session compaction uses the shared compaction runtime, so a
+    # configured compactor preset routes manual compaction the same way as
+    # automatic compaction and idle archival. The compactor summarizes without
+    # the session's tool schemas (tools=[]) so it cannot start calling them.
+    runtime, tools, no_tool_contract, replay_config = await loop.compaction_runtime_for_session(session)
     delivery = loop.turn_delivery_factory.create(ctx.msg, ctx.key)
 
     try:
-        await loop.consolidator.compact_idle_session(
+        summary = await loop.consolidator.compact_idle_session(
             ctx.key,
             runtime=runtime,
+            tools=tools,
+            no_tool_contract=no_tool_contract,
+            replay_config=replay_config,
             events=delivery.events,
             notify=True,
             reason="manual",
         )
     except Exception:
         logger.exception("Manual context compaction failed for {}", ctx.key)
-        return
+        return None
 
+    if summary != "" or replay_config.min_verbatim_tail_tokens <= 0:
+        return None
+    content = "No history to compact."
+    if any(
+        not message.get("_command") and not is_summary_checkpoint(message)
+        for message in session.messages[session.last_archived:]
+    ):
+        content = "Context unchanged: no compaction fit while keeping the configured minimum of recent history."
+    return OutboundMessage(
+        channel=ctx.msg.channel, chat_id=ctx.msg.chat_id, content=content,
+        metadata=dict(ctx.msg.metadata or {}),
+    )
 
 
 def _format_preset_names(names: list[str]) -> str:

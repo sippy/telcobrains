@@ -1421,7 +1421,7 @@ Existing configs do not need to change. Direct `agents.defaults.model`, `provide
 
 </details>
 
-`modelPresets` is a top-level object. Each key (`fast`, `deep`, `coding`, etc.) is the preset's one canonical name: it is shown in the interface, passed to `/model <name>`, and referenced by defaults, fallbacks, sessions, and Dream. New and renamed presets must be unique ignoring case. Existing keys accepted by earlier releases remain loadable so upgrades do not break startup. Each preset supports:
+`modelPresets` is a top-level object. Each key (`fast`, `deep`, `coding`, etc.) is the preset's one canonical name: it is shown in the interface, passed to `/model <name>`, and referenced by defaults, fallbacks, sessions, Dream, and the compactor. New and renamed presets must be unique ignoring case. Existing keys accepted by earlier releases remain loadable so upgrades do not break startup. Each preset supports:
 
 Older configs may still contain a `label` inside a preset. It is accepted when loading for compatibility but ignored; the object key remains the canonical name.
 
@@ -2572,6 +2572,54 @@ If your provider retains its prompt cache longer, you can increase the idle time
 The compacted context remains available after restarting nanobot.
 
 Use `/compact` in chat to compact the current session without waiting for the idle threshold.
+
+## Compactor
+
+By default, compaction calls (context-pressure compaction, provider-native local summarization, manual `/compact`, SDK session compaction, and idle archival) run on the same model preset as the session's foreground turn. To route only those summarization calls to a dedicated model, configure the endpoint on a provider and select it from a named preset:
+
+```json
+{
+  "providers": {
+    "custom": { "apiBase": "http://localhost:8082/v1", "apiKey": "local" }
+  },
+  "modelPresets": {
+    "compactor": {
+      "model": "lfm3-1.7b-int8",
+      "provider": "custom",
+      "maxTokens": 2048,
+      "contextWindowTokens": 16384
+    }
+  },
+  "agents": {
+    "defaults": {
+      "compactor": { "modelOverride": "compactor" }
+    }
+  }
+}
+```
+
+`modelOverride` must name a preset in `modelPresets`; the implicit `default` preset is not accepted. The endpoint (`apiBase`, key) belongs to the provider entry, not the preset. Set the preset's `maxTokens` and `contextWindowTokens` to the compactor model's real limits: they bound the summarization call (input budget is window minus output limit and a safety buffer) and cap the resulting checkpoint.
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `agents.defaults.compactor.modelOverride` | `null` | Optional named model preset from `modelPresets` used for context compaction and session summarization, without changing the model doing the task. |
+| `agents.defaults.compactor.nextTurnInputReserveTokens` | `0` | Optional foreground input tokens to keep free for the next turn's fresh input during idle, manual `/compact`, and SDK session compaction. `0` keeps the existing sizing. |
+| `agents.defaults.compactor.minVerbatimTailTokens` | `90000` | Minimum tokens of recent verbatim history to keep after session compaction, counting only the replayable tail. `0` disables the floor and keeps the legacy full-prefix fallback. |
+
+The override applies to context compaction (including subagent contexts), local summarization when the provider compacts natively, manual `/compact`, SDK session compaction, and idle archival. It changes summarization, not the model doing the task. Dream has its own `dream.modelOverride` setting. Current exception: `/new` background archival still uses the session model. When the summarization input does not fit the compactor's context window, or the compactor call fails, nanobot writes a raw checkpoint instead, the same fallback as for any model. When the compactor is a different provider than the session model, provider-native compaction summarizes the materialized transcript instead of resuming the foreign provider's private state.
+
+All three options are available in the WebUI under **Settings → System → Sessions**. The compaction model picker lists the named `modelPresets` entries, and leaving it unset keeps the session model; the next-turn reserve and the verbatim-tail floor are non-negative token counts.
+
+Session compaction (idle archival, `/compact`, SDK session compaction) runs without fresh user input, so by default the retained verbatim tail may consume the whole foreground replay headroom and the very next message can trigger another compaction. When `nextTurnInputReserveTokens` is greater than `0`, that many foreground input tokens are reserved for the next turn's fresh input against the retained tail's replay headroom, including the projected post-compaction request probe: the retained tail shrinks accordingly, and when no legal cut still fits, session compaction skips with a positive verbatim-tail floor or uses the legacy full-prefix fallback with the floor disabled. The reserve does not reduce the compactor's input capacity, and in-turn context-pressure compaction does not charge it, because its sizing already includes the real pending input. A larger reserve is opt-in: it keeps less recent history verbatim.
+
+`minVerbatimTailTokens` is the complement of the reserve: a lower bound on how much recent history survives a session compaction, not extra input headroom. It counts only the replayable raw tail at the legal cut — never the summary, the prompt, or the fresh delta — and the two existing budgets (the next-turn reserve for idle/manual/SDK, and the real delta for foreground) still apply independently on top of it. Nanobot tries to keep the largest legal tail that fits. The floor applies differently by compaction path:
+
+- **Idle, manual `/compact`, and SDK session compaction** — if the history is at or below the floor, or the oldest eligible cut does not pass the final budget checks, compaction skips without changing the replayable history. With the floor enabled, `/compact` explains the skip. Idle scans remember the decision for unchanged history and sizing settings.
+- **Foreground context-pressure compaction** — safety wins. It prefers a cut that meets the floor, but when the window cannot hold the floor alongside the rest of the request it uses the best existing safe smaller-tail cut or the existing fallback, rather than sending an oversized request or blocking a feasible turn. It therefore never skips.
+
+Setting a floor above what a given window can retain is a policy choice: it can leave a session uncompacted until in-turn compaction (which ignores the floor) handles it, and it does not add staged summarization or change the idle TTL.
+
+A configured compactor request offers no tools: the task model's tool schemas are not sent, and tools or a `tool_choice` configured in the preset's `extraBody` are not merged into it either, so small local models cannot answer a summarization by calling tools. The no-tools contract is the configured compactor's policy and applies to every compactor request shape, including native-state (resumable) requests: provider state persists conversation items, not tool schemas, so a tool-free request still replays the prior transcript unchanged. Legacy no-override compaction is unaffected: it keeps its existing request shape, even when the session's tool registry happens to be empty, and ordinary requests keep configured `extraBody` tools and choice without the contract.
 
 ## Timezone
 

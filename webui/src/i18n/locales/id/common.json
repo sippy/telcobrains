@@ -551,6 +551,18 @@
         "agents_defaults_max_tool_result_chars": {"label": "Panjang hasil", "help": "Batas karakter tiap hasil alat yang dikirim ke model.\n\nMembatasi keluaran alat yang disertakan dalam konteks model."},
         "agents_defaults_provider_retry_mode": {"label": "Terus mencoba", "help": "Ulangi setelah kesalahan yang dapat dipulihkan; nonaktifkan untuk percobaan standar.\n\nMencoba kembali permintaan ke model saat terjadi kesalahan sementara. Nonaktifkan untuk membatasi jumlah percobaan ulang."},
         "agents_defaults_tool_hint_max_length": {"label": "Panjang ringkasan", "help": "Batas karakter ringkasan aktivitas alat.\n\nPanjang maksimum petunjuk singkat aktivitas alat."},
+        "agents_defaults_compactor_model_override": {
+          "label": "Model pemadatan",
+          "help": "Preset model yang merangkum konteks yang dipadatkan. Sesi tetap menggunakan modelnya sendiri.\n\nBiarkan kosong untuk memadatkan dengan model aktif sesi."
+        },
+        "agents_defaults_compactor_next_turn_input_reserve_tokens": {
+          "label": "Reservasi masukan giliran berikutnya",
+          "help": "Token masukan yang tetap bebas setelah pemadatan sesi (idle, manual, atau SDK) agar pesan berikutnya muat tanpa memadatkan lagi.\n\n0 mempertahankan perilaku saat ini. Reservasi lebih besar mengurangi riwayat terbaru yang dipertahankan apa adanya."
+        },
+        "agents_defaults_compactor_min_verbatim_tail_tokens": {
+          "label": "Ekor verbatim minimum",
+          "help": "Token minimum riwayat terbaru yang dipertahankan apa adanya setelah pemadatan sesi (idle, manual, atau SDK). Hanya ekor yang dapat diputar ulang yang dihitung — tidak pernah ringkasan, prompt, atau masukan baru.\n\n0 menonaktifkan batas dan mempertahankan fallback prefix penuh. Jika sesi tidak dapat mempertahankan sebanyak itu, sesi diabaikan alih-alih dipadatkan lebih kecil. Pemadatan foreground tetap memadatkan agar muat di jendela."
+        },
         "tools_max_session_messages_per_minute": {"label": "Frekuensi pesan", "help": "Batas pesan alat ke satu sesi per menit.\n\nMembatasi frekuensi alat mengirim pesan ke percakapan."},
         "tools_exec_enable": {"label": "Alat shell", "help": "Izinkan agen menjalankan perintah Shell.\n\nMengizinkan agen menjalankan perintah shell."},
         "tools_file_enable": {"label": "Alat file", "help": "Izinkan alat bawaan untuk membaca dan mengedit berkas.\n\nMengizinkan alat bawaan untuk membaca dan mengedit file."},

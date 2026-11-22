@@ -433,6 +433,36 @@ def _merge_responses_extra_body(
     return merged
 
 
+def _apply_no_tool_choice(
+    body: dict[str, Any],
+    caller_offered_tools: bool,
+) -> dict[str, Any]:
+    """Enforce an explicit ``tool_choice='none'`` request after configured merges.
+
+    ``extra_body`` is merged on top of the request body (in the OpenAI SDK,
+    inside ``extra_body``), so configured ``tools`` / ``tool_choice`` could
+    otherwise re-enable tool calls on a tool-free request. When the caller
+    offers no tools, the request must stay tool-free: drop the merged tool
+    set and any ``tool_choice`` (strict endpoints reject it without tools).
+    When the caller offers tools but forbids calls, keep the schemas and force
+    ``tool_choice='none'`` so a configured merge cannot override it.
+    """
+    raw_extra = body.get("extra_body")
+    if isinstance(raw_extra, dict) and "tool_choice" in raw_extra:
+        extra = cast(dict[str, Any], raw_extra)
+        stripped = {key: value for key, value in extra.items() if key != "tool_choice"}
+        if stripped:
+            body["extra_body"] = stripped
+        else:
+            body.pop("extra_body", None)
+    if caller_offered_tools:
+        body["tool_choice"] = "none"
+        return body
+    body.pop("tools", None)
+    body.pop("tool_choice", None)
+    return body
+
+
 class OpenAICompatProvider(LLMProvider):
     """Provider for OpenAI-compatible Chat Completions and Responses endpoints.
 
@@ -1011,6 +1041,8 @@ class OpenAICompatProvider(LLMProvider):
         # otherwise lets extra_body.tools replace nanobot's generated functions.
         if self._extra_body:
             kwargs = _merge_chat_extra_body(kwargs, self._extra_body)
+        if tool_choice == "none":
+            kwargs = _apply_no_tool_choice(kwargs, caller_offered_tools=bool(tools))
         if extra_headers:
             kwargs["extra_headers"] = extra_headers
 
@@ -1225,6 +1257,9 @@ class OpenAICompatProvider(LLMProvider):
                         body["include"] = [*configured_include, source_include]
                 else:
                     body["include"] = [source_include]
+
+        if tool_choice == "none":
+            body = _apply_no_tool_choice(body, caller_offered_tools=bool(tools))
 
         return body
 
