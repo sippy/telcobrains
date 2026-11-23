@@ -1,6 +1,6 @@
 import { expect, test } from "@playwright/test";
 
-test("sidebar cat follows the chosen app theme without moving or losing the draft", async ({ page }) => {
+test("sidebar logo follows the chosen app theme without moving or losing the draft", async ({ page }) => {
   await page.setViewportSize({ width: 1440, height: 900 });
   await page.emulateMedia({ colorScheme: "dark", reducedMotion: "reduce" });
   await page.addInitScript(() => {
@@ -11,20 +11,22 @@ test("sidebar cat follows the chosen app theme without moving or losing the draf
   const mark = page.getByTestId("sidebar-brand-mark");
   const day = mark.locator("img").nth(0);
   const night = mark.locator("img").nth(1);
-  await expect.poll(() => mark.locator("img").evaluateAll(elements => elements.every(element => {
+  await expect(day).toHaveAttribute("src", "/brand/nanobot_mark.svg");
+  await expect(night).toHaveAttribute("src", "/brand/nanobot_mark_night.png");
+  await expect.poll(() => mark.locator("img").evaluateAll(elements => elements.map(element => {
     const image = element as HTMLImageElement;
-    return image.complete && image.naturalWidth === 759 && image.naturalHeight === 718;
-  }))).toBe(true);
+    return image.complete && image.naturalWidth > 0 && image.naturalWidth === image.naturalHeight;
+  }))).toEqual([true, true]);
   await expect(day).toHaveCSS("opacity", "1");
   await expect(night).toHaveCSS("opacity", "0");
   const before = (await mark.boundingBox())!;
   const draft = page.getByRole("textbox");
-  await draft.fill("Keep this draft while the cat gets sleepy");
+  await draft.fill("Keep this draft while the logo changes");
   await page.getByRole("button", { name: "Toggle theme from header", exact: true }).click();
   await expect(night).toHaveCSS("opacity", "1");
   await expect(day).toHaveCSS("opacity", "0");
   expect(await mark.boundingBox()).toEqual(before);
-  await expect(draft).toHaveValue("Keep this draft while the cat gets sleepy");
+  await expect(draft).toHaveValue("Keep this draft while the logo changes");
   await page.reload();
   await expect(night).toHaveCSS("opacity", "1");
   await page.getByRole("button", { name: "Toggle theme from header", exact: true }).click();

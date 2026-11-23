@@ -198,7 +198,7 @@ export function Sidebar(props: SidebarProps) {
                 draggable={false}
               />
               <img
-                src="/brand/nanobot_mark_night.svg"
+                src="/brand/nanobot_mark_night.png"
                 alt=""
                 className="theme-art absolute inset-0 h-8 w-8 select-none object-contain opacity-0 dark:opacity-100"
                 draggable={false}

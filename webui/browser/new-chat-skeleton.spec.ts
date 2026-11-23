@@ -87,12 +87,12 @@ test("keeps the welcome marks proportional and inside split panes as the window 
       const mark = await box(pane.getByTestId("thread-welcome-mark"));
       expect(mark.x).toBeGreaterThanOrEqual(region.x - 0.1);
       expect(mark.x + mark.width).toBeLessThanOrEqual(region.x + region.width + 0.1);
-      expect(mark.width / mark.height).toBeCloseTo(783 / 742, 2);
+      expect(mark.width / mark.height).toBeCloseTo(1, 2);
     }
   }
 });
 
-test("draws the nose bridge and the original cheek lines", async ({ page }) => {
+test("draws the TelcoBrains outline without filling the mark", async ({ page }) => {
   await page.route("**/api/commands", (route) => route.fulfill({ json: { commands: [] } }));
   await page.goto("/browser/fixture.html?case=new-chat-skeleton");
   await expect(page.getByTestId("thread-welcome-mark")).toBeVisible();
@@ -101,18 +101,18 @@ test("draws the nose bridge and the original cheek lines", async ({ page }) => {
     image.src = "/brand/nanobot_mark_outline.svg";
     await image.decode();
     const canvas = document.createElement("canvas");
-    canvas.width = 783;
-    canvas.height = 742;
+    canvas.width = 512;
+    canvas.height = 512;
     const context = canvas.getContext("2d")!;
     context.drawImage(image, 0, 0);
-    return [[379, 200], [379, 400], [379, 650], [80, 497], [680, 497]]
-      .map(([x, y]) => context.getImageData(x + 12, y + 12, 1, 1).data[3]);
+    return [[256, 1], [256, 15], [256, 35], [255, 403], [255, 425]]
+      .map(([x, y]) => context.getImageData(x, y, 1, 1).data[3]);
   });
-  expect(pixels[0]).toBe(0);
-  expect(pixels[1]).toBeGreaterThan(0);
+  expect(pixels[0]).toBeGreaterThan(0);
+  expect(pixels[1]).toBe(0);
   expect(pixels[2]).toBe(0);
   expect(pixels[3]).toBeGreaterThan(0);
-  expect(pixels[4]).toBeGreaterThan(0);
+  expect(pixels[4]).toBe(0);
 });
 
 for (const reducedMotion of ["no-preference", "reduce"] as const) {

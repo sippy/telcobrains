@@ -2,9 +2,8 @@
   position: absolute;
   bottom: -3rem;
   left: 50%;
-  /* 94.76cqw is the height of the 783:742 mark at its container's width. */
-  height: min(19.9rem, calc(100% + 3rem), 66.3vw, 94.76cqw);
-  aspect-ratio: 783 / 742;
+  height: min(19.9rem, calc(100% + 3rem), 66.3vw, 100cqw);
+  aspect-ratio: 1;
   pointer-events: none;
   transform: translateX(-50%);
   mask-image: linear-gradient(to bottom, #000 0%, rgb(0 0 0 / 0.8) 32%, rgb(0 0 0 / 0.28) 70%, transparent 100%);
@@ -18,7 +17,7 @@
 }
 
 .thread-welcome-mark__fill {
-  background: url('/brand/nanobot_mark.svg') center / calc(100% * 759 / 783) auto no-repeat;
+  background: url('/brand/nanobot_mark.svg') center / contain no-repeat;
   filter: grayscale(1);
   opacity: 0.06;
 }
