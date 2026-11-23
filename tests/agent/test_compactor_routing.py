@@ -13,6 +13,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from loguru import logger
 
 from nanobot.agent.context_governance import (
     ContextCompactionState,
@@ -25,11 +26,19 @@ from nanobot.agent.tools.registry import ToolRegistry
 from nanobot.bus.events import InboundMessage
 from nanobot.bus.queue import MessageBus
 from nanobot.config.schema import Config, ModelPresetConfig
+from nanobot.llm_usage.types import LLMUsage
 from nanobot.providers import factory
-from nanobot.providers.base import GenerationSettings, LLMProvider, LLMResponse, ToolCallRequest
+from nanobot.providers.base import (
+    GenerationSettings,
+    LLMProvider,
+    LLMResponse,
+    ProviderConversationState,
+    ToolCallRequest,
+)
 from nanobot.providers.conversation_state import ProviderConversationStateController
 from nanobot.providers.factory import ProviderSnapshot
 from nanobot.sdk.clients import RuntimeClient
+from nanobot.session.summary import is_summary_checkpoint
 
 COMPACTOR_PRESET = ModelPresetConfig(
     model="compactor-model",
@@ -1072,3 +1081,228 @@ async def test_from_config_wires_min_verbatim_tail(tmp_path, monkeypatch) -> Non
         assert replay_config.min_verbatim_tail_tokens == 12_000
     finally:
         await loop.aclose()
+
+
+@pytest.fixture
+async def oversized_import(tmp_path, monkeypatch):
+    foreground, loop = _make_loop(
+        tmp_path, context_window_tokens=120_000, fg_max_tokens=100,
+        next_turn_input_reserve_tokens=4_000, min_verbatim_tail_tokens=90_000,
+    )
+    compactor = loop.compactor_runtime().provider
+    key = "cli:oversized-import"
+
+    def cost(message):
+        return 4 + sum(len(str(message.get(field, "")).encode()) for field in (
+            "content", "tool_calls", "tool_call_id", "name",
+        ))
+
+    def estimate(messages, tools, model):
+        return sum(map(cost, messages)), "synthetic-byte-counter"
+
+    for module in ("context_governance", "memory"):
+        monkeypatch.setattr(f"nanobot.agent.{module}.estimate_message_tokens", cost)
+    foreground.estimate_prompt_tokens.side_effect = estimate
+    compactor.estimate_prompt_tokens.side_effect = estimate
+    imported = [{"role": "user", "content": "Review these synthetic batches."}]
+    for i in range(17):
+        imported.extend([
+            {"role": "assistant", "content": f"Batch {i}: " + "x" * 23_000,
+             "tool_calls": [{"id": f"call-{i}", "type": "function", "function": {
+                 "name": "read_file", "arguments": "{}",
+             }}]},
+            {"role": "tool", "tool_call_id": f"call-{i}", "name": "read_file",
+             "content": "synthetic result " + "y" * 1_000},
+        ])
+    imported.append({"role": "assistant", "content": "All batches read."})
+    session = loop.sessions.get_or_create(key)
+    session.provider_state = ProviderConversationState(
+        kind="openai_responses", provider="openai:test", model="test-model",
+        version=1, payload={"items": []},
+    )
+    loop.sessions.save(session)
+    try:
+        session = await loop.sessions.state.import_messages(key, imported, require_empty=True)
+        assert session.provider_state is not None
+        yield loop, compactor, foreground, key, session, cost
+    finally:
+        await loop.aclose()
+
+
+@pytest.mark.parametrize("sizing_mismatch", [False, True], ids=["additive-fit", "earlier-exact-fit"])
+async def test_oversized_import_dry_run_and_manual_apply_use_the_same_stages(oversized_import, sizing_mismatch):
+    loop, compactor, foreground, key, original, cost = oversized_import
+    full_history = original.get_history()
+    input_budget = 200_000 - 4_096
+    probed_batch_counts = []
+
+    def estimate(messages, tools, model):
+        if sizing_mismatch and messages and messages[0].get("content") == full_history[0]["content"]:
+            batches = sum(bool(message.get("tool_calls")) for message in messages)
+            probed_batch_counts.append(batches)
+            # The additive fit is eight bundles; exact sizing fits seven, with
+            # no headroom. Don't change the later carry-stage estimates.
+            if batches in (7, 8):
+                return input_budget + (batches - 7), "synthetic-exact-counter"
+        return sum(map(cost, messages)), "synthetic-byte-counter"
+
+    compactor.estimate_prompt_tokens.side_effect = estimate
+
+    def summarize(**request):
+        batch = [m for m in request["messages"] if m.get("tool_calls")][-1]
+        return LLMResponse(
+            content=f"Checkpoint through {batch['tool_calls'][0]['id']}.", finish_reason="stop",
+            usage=LLMUsage.reported(input_tokens=sum(map(cost, request["messages"])), output_tokens=10)
+            .with_timing(generation_ms=400, ttft_ms=50),
+        )
+
+    compactor.chat_stream_with_retry.side_effect = summarize
+
+    async def command(content):
+        return await loop._process_message(
+            InboundMessage(channel="cli", sender_id="user", chat_id="oversized-import", content=content),
+            runtime=loop.llm_runtime(),
+        )
+
+    reply = await command("/compact --dry-run")
+    assert reply is not None
+    assert "summary generated by the compactor (discarded)" in reply.content
+    requests = [call.kwargs for call in compactor.chat_stream_with_retry.call_args_list]
+    assert len(requests) == 2
+    if sizing_mismatch:
+        assert probed_batch_counts[:3] == [13, 8, 7]
+        assert sum(bool(m.get("tool_calls")) for m in requests[0]["messages"]) == 7
+    assert "- Stage 1:" in reply.content and "- Stage 2:" in reply.content
+    assert "25.0 output tokens/s (measured streaming)" in reply.content
+    assert "10 output tokens" in reply.content
+    loop.sessions.invalidate(key)
+    unchanged = loop.sessions.get_or_create(key)
+    assert unchanged.get_history() == full_history
+    assert unchanged.last_archived == 0
+    assert unchanged.provider_state == original.provider_state
+    assert loop.consolidator.store.read_unprocessed_history(0) == []
+
+    compactor.chat_stream_with_retry.reset_mock()
+    await command("/compact")
+    assert [call.kwargs for call in compactor.chat_stream_with_retry.call_args_list] == requests
+    foreground.chat_stream_with_retry.assert_not_awaited()
+    prefix = []
+    carry = None
+    for i, request in enumerate(requests):
+        assert request["tools"] == [] and request["tool_choice"] == "none"
+        estimated, _ = estimate(request["messages"], request["tools"], request["model"])
+        assert estimated + request["max_tokens"] <= 200_000
+        messages = request["messages"][:-1]
+        if i:
+            assert messages[0]["content"] == f"[Archived Context Summary]\n\n{carry}"
+            messages = messages[1:]
+        calls = {call["id"] for m in messages for call in m.get("tool_calls", [])}
+        assert calls == {m["tool_call_id"] for m in messages if m["role"] == "tool"}
+        prefix.extend(messages)
+        carry = summarize(**request).content
+    loop.sessions.invalidate(key)
+    applied = loop.sessions.get_or_create(key)
+    assert prefix == full_history[:applied.last_archived]
+    assert applied.get_history() == full_history[applied.last_archived:]
+    assert applied.get_history()[0]["role"] == "assistant"
+    assert sum(map(cost, applied.get_history())) >= 90_000
+    assert applied.provider_state is None
+    assert applied.metadata["_last_summary"]["text"] == "Checkpoint through call-12."
+    assert sum(is_summary_checkpoint(m) for m in applied.messages) == 1
+    [entry] = loop.consolidator.store.read_unprocessed_history(0)
+    assert entry["content"] == "Checkpoint through call-12."
+
+    # A new foreground turn resumes from the persisted summary and retained
+    # assistant-leading tail, not from an intermediate stage or old raw prefix.
+    await command("What is the latest status?")
+    foreground.chat_stream_with_retry.assert_awaited_once()
+    replay = foreground.chat_stream_with_retry.call_args.kwargs["messages"]
+    assert "Checkpoint through call-12." in replay[0]["content"]
+    assert {m["tool_call_id"] for m in replay if m["role"] == "tool"} == {
+        "call-13", "call-14", "call-15", "call-16",
+    }
+
+
+async def test_staged_sdk_checkpoint_succeeds_if_journal_cursor_write_fails(oversized_import):
+    loop, compactor, _, key, original, _ = oversized_import
+    store = loop.consolidator.store
+    # A directory at the cursor path makes write_text fail after the journal
+    # row was appended. The caller must not see failure or retry the append.
+    store._cursor_file.mkdir()
+    warnings = []
+    sink = logger.add(warnings.append, level="WARNING", format="{message}")
+    try:
+        assert await RuntimeClient(loop).compact_idle_session(key) == "Checkpoint."
+    finally:
+        logger.remove(sink)
+
+    assert compactor.chat_stream_with_retry.await_count == 2
+    assert any(f"Staged checkpoint applied for {key} but updating the memory journal failed" in w for w in warnings)
+    loop.sessions.invalidate(key)
+    applied = loop.sessions.get_or_create(key)
+    assert applied.metadata["_last_summary"]["text"] == "Checkpoint."
+    assert applied.provider_state is None
+    assert applied.last_archived > 0
+    assert applied.get_history() == original.get_history()[applied.last_archived:]
+    [entry] = store.read_unprocessed_history(0)
+    assert entry["content"] == "Checkpoint."
+
+
+@pytest.mark.parametrize("failure", [
+    "provider", "oversized_carry", "replay_over_budget", "cancelled", "timeout", "stage_limit",
+])
+async def test_staged_sdk_failure_preserves_imported_session(oversized_import, monkeypatch, failure):
+    loop, compactor, foreground, key, original, cost = oversized_import
+    second_stage = asyncio.Event()
+
+    async def summarize(**request):
+        if compactor.chat_stream_with_retry.await_count == 1:
+            return LLMResponse(content="Carry.")
+        if failure == "replay_over_budget":
+            return LLMResponse(content="Final checkpoint.")
+        second_stage.set()
+        if failure in {"cancelled", "timeout"}:
+            await asyncio.Future()
+        raise RuntimeError("synthetic provider failure")
+
+    compactor.chat_stream_with_retry.side_effect = summarize
+
+    def estimate_with_mismatch(marker):
+        def estimate(messages, tools, model):
+            if any(marker in m.get("content", "") for m in messages):
+                return 200_000, "synthetic-counter-mismatch"
+            return sum(map(cost, messages)), "synthetic-byte-counter"
+        return estimate
+
+    if failure == "oversized_carry":
+        compactor.estimate_prompt_tokens.side_effect = estimate_with_mismatch("Carry.")
+    elif failure == "replay_over_budget":
+        foreground.estimate_prompt_tokens.side_effect = estimate_with_mismatch("Final checkpoint.")
+    elif failure == "stage_limit":
+        monkeypatch.setattr(loop.consolidator, "_STAGED_MAX_STAGES", 1)
+    elif failure == "timeout":
+        monkeypatch.setattr(loop.consolidator, "_STAGED_MAX_SECONDS", 0.15)
+
+    attempt = RuntimeClient(loop).compact_idle_session(key)
+    if failure == "cancelled":
+        task = asyncio.create_task(attempt)
+        try:
+            await asyncio.wait_for(second_stage.wait(), timeout=5)
+        finally:
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+    elif failure == "stage_limit":
+        assert await attempt == ""
+        compactor.chat_stream_with_retry.assert_not_awaited()
+    else:
+        assert await attempt is None
+        assert compactor.chat_stream_with_retry.await_count == (1 if failure == "oversized_carry" else 2)
+
+    loop.sessions.invalidate(key)
+    reloaded = loop.sessions.get_or_create(key)
+    assert reloaded.messages == original.messages
+    assert reloaded.provider_state == original.provider_state
+    assert reloaded.last_archived == original.last_archived == 0
+    assert "_last_summary" not in reloaded.metadata
+    assert loop.consolidator.store.read_unprocessed_history(0) == []

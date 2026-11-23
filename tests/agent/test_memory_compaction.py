@@ -157,7 +157,7 @@ def test_legal_cut_indices_keep_tool_pairs_whole():
         {"role": "tool", "tool_call_id": "c2", "name": "exec", "content": "r2"},
     ]
 
-    legal = ContextGovernor._legal_cut_indices(raw, len(raw))
+    legal = ContextGovernor.legal_cut_indices(raw, len(raw))
 
     # Cutting before a result whose call is in the prefix splits the pair.
     assert legal[5] is False
@@ -172,7 +172,7 @@ def test_legal_cut_indices_keep_tool_pairs_whole():
         {"role": "user", "content": "q1"},
         {"role": "tool", "tool_call_id": "unknown", "name": "exec", "content": "r"},
     ]
-    assert ContextGovernor._legal_cut_indices(orphan, len(orphan)) == [
+    assert ContextGovernor.legal_cut_indices(orphan, len(orphan)) == [
         False, False, False,
     ]
 
@@ -368,7 +368,11 @@ _SESSION_HISTORY = [
 
 
 def _session_cut(monkeypatch, *, reserve: int, budget: CompactorInputBudget) -> int | None:
-    """Call ``select_prefix_cut`` the way session compaction does: no unsent delta."""
+    """Call ``select_prefix_cut`` the way session compaction does: no unsent delta.
+
+    The session path supplies the replayable history itself; the wrapper is
+    only the post-compaction replay prefix, never part of the compacted raw.
+    """
     _cost_model(monkeypatch)
     config = ContextGovernanceConfig(
         provider=MagicMock(spec=LLMProvider),
@@ -381,7 +385,7 @@ def _session_cut(monkeypatch, *, reserve: int, budget: CompactorInputBudget) -> 
         max_tokens=100,
     )
     wrapper = [{"role": "system", "content": "wrapper"}]
-    raw = [*wrapper, *_SESSION_HISTORY]
+    raw = list(_SESSION_HISTORY)
     return ContextGovernor().select_prefix_cut(
         config, raw, len(raw), budget, wrapper, None, [], None,
         session_compaction=True,
@@ -395,11 +399,11 @@ def test_session_cut_charges_reserve_against_replay_headroom(monkeypatch):
     )
     # Without a reserve the oldest legal tail (q2..a3, 530 tokens) fits the
     # 656-token headroom.
-    assert _session_cut(monkeypatch, reserve=0, budget=budget) == 4
+    assert _session_cut(monkeypatch, reserve=0, budget=budget) == 3
     # The same headroom minus 126 tokens still holds the tail exactly; one
     # more reserved token leaves no legal user boundary, so compaction falls
     # back to the full prefix.
-    assert _session_cut(monkeypatch, reserve=126, budget=budget) == 4
+    assert _session_cut(monkeypatch, reserve=126, budget=budget) == 3
     assert _session_cut(monkeypatch, reserve=127, budget=budget) is None
 
 
@@ -410,8 +414,8 @@ def test_session_cut_reserve_does_not_reduce_compactor_capacity(monkeypatch):
     budget = CompactorInputBudget(
         input_budget=700, fixed_overhead_tokens=100, max_summary_tokens=100,
     )
-    assert _session_cut(monkeypatch, reserve=0, budget=budget) == 4
-    assert _session_cut(monkeypatch, reserve=200, budget=budget) == 4
+    assert _session_cut(monkeypatch, reserve=0, budget=budget) == 3
+    assert _session_cut(monkeypatch, reserve=200, budget=budget) == 3
 
 
 def _session_cut_with_floor(
@@ -438,7 +442,7 @@ def _session_cut_with_floor(
         min_verbatim_tail_tokens=floor,
     )
     wrapper = [{"role": "system", "content": "wrapper"}]
-    raw = [*wrapper, *history]
+    raw = list(history)
     return ContextGovernor().select_prefix_cut(
         config, raw, len(raw), budget, wrapper, None, [], None,
         session_compaction=True,
@@ -472,8 +476,8 @@ def test_session_cut_uses_tool_pair_safe_assistant_boundary_for_tool_heavy_turn(
     )
     cut = _session_cut_with_floor(monkeypatch, _TOOL_TURN_HISTORY, floor=900, budget=budget, heavy="HEAVY")
 
-    raw = [{"role": "system", "content": "wrapper"}, *_TOOL_TURN_HISTORY]
-    assert cut == 2
+    raw = list(_TOOL_TURN_HISTORY)
+    assert cut == 1
     assert raw[cut]["role"] == "assistant"
     assert raw[cut]["tool_calls"][0]["id"] == "c1"
     tail = raw[cut:]
@@ -487,9 +491,12 @@ def test_session_cut_uses_tool_pair_safe_assistant_boundary_for_tool_heavy_turn(
 
 
 def test_session_mid_turn_cut_must_fit_both_budgets_and_reserve(monkeypatch):
-    # The only tail meeting the 900-token floor costs 1050 tokens; its prefix
-    # costs 510. Reserving one more input token, or taking one away from the
-    # compactor, independently makes the cut impossible.
+    # The only tail meeting the 900-token floor (the tool-heavy turn opening
+    # with c1) costs 1050 tokens; its prefix costs 500. The 1070-token
+    # projected request (wrapper, tail, continuation) plus the 200 reserved
+    # summary output fills the 1376-token headroom, so reserving one more
+    # input token, or shrinking the compactor below the 500-token prefix,
+    # independently makes the cut impossible.
     def cut(reserve: int, compactor_input: int) -> int | None:
         return _session_cut_with_floor(
             monkeypatch, _TOOL_TURN_HISTORY, floor=900, reserve=reserve,
@@ -497,9 +504,11 @@ def test_session_mid_turn_cut_must_fit_both_budgets_and_reserve(monkeypatch):
             budget=CompactorInputBudget(compactor_input, 100, 200),
         )
 
-    assert cut(106, 610) == 2
+    assert cut(106, 610) == 1
     assert cut(107, 610) is None
-    assert cut(106, 609) is None
+    # A 500-token prefix exactly fills the 500 capacity; one less token does not.
+    assert cut(106, 600) == 1
+    assert cut(106, 599) is None
 
 
 def test_session_cut_floor_disabled_keeps_legacy_user_boundary_sizing(monkeypatch):
@@ -508,10 +517,10 @@ def test_session_cut_floor_disabled_keeps_legacy_user_boundary_sizing(monkeypatc
     )
     cut = _session_cut_with_floor(monkeypatch, _TOOL_TURN_HISTORY, floor=0, budget=budget, heavy="HEAVY")
 
-    raw = [{"role": "system", "content": "wrapper"}, *_TOOL_TURN_HISTORY]
+    raw = list(_TOOL_TURN_HISTORY)
     # Legacy sizing: the oldest user boundary (q2) wins and the mid-turn
     # assistant boundary stays out of play without a floor.
-    assert cut == 7
+    assert cut == 6
     assert raw[cut]["role"] == "user"
 
 

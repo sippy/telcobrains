@@ -70,7 +70,7 @@ Use these slash commands in chat to inspect, run, or restore memory:
 | Command | What it does |
 |---|---|
 | `/compact` | Summarize the current conversation now (full chat history remains visible) |
-| `/compact --dry-run` | Run the real compactor once and report the outcome without applying it (the conversation is unchanged apart from the stored command reply; provider inference can still occur) |
+| `/compact --dry-run` | Run and report the real compaction, including any stages, without applying it (only the command reply is stored; provider inference can still occur) |
 | `/dream` | Run Dream consolidation now |
 | `/dream-log` | Show the latest Dream memory change |
 | `/dream-log <sha>` | Show a specific Dream memory change |

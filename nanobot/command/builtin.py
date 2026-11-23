@@ -327,7 +327,7 @@ async def cmd_compact(ctx: CommandContext) -> OutboundMessage | None:
 
 
 async def _compact_dry_run(ctx: CommandContext) -> OutboundMessage:
-    """Test-run the real compactor once and report the outcome without applying it."""
+    """Test-run the real compaction and report the outcome without applying it."""
     loop = ctx.loop
     metadata = {**dict(ctx.msg.metadata or {}), "render_as": "text"}
     session = ctx.session or await loop.sessions.state.get(ctx.key)
@@ -377,8 +377,9 @@ async def _compact_dry_run(ctx: CommandContext) -> OutboundMessage:
 def _format_compact_dry_run(preview: CompactionPreview) -> str:
     lines = ["## Compaction dry run", ""]
     if preview.provider_calls > 0:
+        stages = f" across {len(preview.stages)} attempted stages" if preview.stages else ""
         lines.append(
-            "The compactor ran the real compaction once and the result was discarded: the "
+            f"The compactor made real summarizer calls{stages}. Nothing was applied: the "
             "conversation, checkpoints, saved history, and provider state are unchanged. "
             "Provider inference (and its cost) was incurred."
         )
@@ -421,12 +422,26 @@ def _format_compact_dry_run(preview: CompactionPreview) -> str:
     else:
         lines.append(f"- Outcome: error — {preview.reason}")
         lines.append("- No changes were made.")
-        if preview.provider_calls:
-            lines.append(f"- Provider calls: {preview.provider_calls}")
-        return "\n".join(lines)
 
     lines.append(f"- Model: `{preview.model}`")
     lines.append(f"- Elapsed: {preview.elapsed_s:.1f}s")
+    for stage in preview.stages:
+        parts = [f"- Stage {stage.stage}: {stage.elapsed_s:.1f}s"]
+        stage_usage = stage.usage
+        if stage_usage is not None:
+            if stage_usage.generation_ms > 0 and stage_usage.measured_output_tokens > 0:
+                parts.append(
+                    f"{stage_usage.measured_output_tokens / (stage_usage.generation_ms / 1000):.1f} "
+                    "output tokens/s (measured streaming)"
+                )
+            elif stage_usage.output_tokens > 0 and stage.elapsed_s > 0:
+                parts.append(
+                    f"{stage_usage.output_tokens / stage.elapsed_s:.1f} output tokens/s (wall clock)"
+                )
+            parts.append(f"{stage_usage.input_tokens} input / {stage_usage.output_tokens} output tokens")
+        elif stage.provider_calls:
+            parts.append(f"{stage.provider_calls} call(s), usage not reported by the provider")
+        lines.append(" ".join(parts))
     usage = preview.usage
     if usage is not None:
         if usage.generation_ms > 0 and usage.measured_output_tokens > 0:
@@ -447,6 +462,8 @@ def _format_compact_dry_run(preview: CompactionPreview) -> str:
         )
     elif preview.provider_calls:
         lines.append(f"- Provider calls: {preview.provider_calls} (usage not reported by the provider)")
+    if preview.outcome == "error":
+        return "\n".join(lines)
     lines.append(
         f"- Before (estimate): {preview.unarchived_count} replayable message(s), "
         f"~{preview.estimated_prompt_tokens} prompt tokens"

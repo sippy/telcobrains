@@ -11,8 +11,9 @@ import re
 import threading
 import time
 import weakref
+from collections import deque
 from contextlib import suppress
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from dataclasses import replace as dataclasses_replace
 from datetime import datetime
 from pathlib import Path
@@ -32,15 +33,18 @@ from nanobot.runtime_context import public_history_messages
 from nanobot.session.manager import Session, SessionManager
 from nanobot.session.message_content import history_message_text
 from nanobot.session.summary import (
+    SUMMARY_CONTINUATION_TEXT,
     CompactorInputBudget,
     is_summary_checkpoint,
     session_summary_from_metadata,
 )
+from nanobot.utils.cancellation import shield_and_drain
 from nanobot.utils.gitstore import MEMORY_CONTENT_PATHS, MEMORY_WIKI_PATH, GitStore
 from nanobot.utils.helpers import (
     atomic_write_lines,
     build_assistant_message,
     ensure_dir,
+    estimate_message_tokens,
     estimate_prompt_tokens_chain,
     strip_think,
     truncate_text,
@@ -819,6 +823,7 @@ class MemoryArchiver:
         no_tool_contract: bool = False,
         persist: bool = True,
         telemetry: CompactionCallTelemetry | None = None,
+        allow_raw_fallback: bool = True,
     ) -> str | None:
         """Generate a replacement checkpoint and optionally persist it.
 
@@ -828,11 +833,20 @@ class MemoryArchiver:
         with an explicit ``tool_choice='none'`` that survives configured
         ``extra_body`` merges. Legacy no-override compaction keeps its
         existing request shape, including an empty session tool registry.
+
+        ``allow_raw_fallback=False`` is the strict contract staged compaction
+        runs each stage under: a request that does not fit, a failed provider
+        call, or unusable output yields ``None`` instead of a bounded raw
+        checkpoint, so one failed stage can never masquerade as a summary.
         """
         if not source_messages:
             return None
 
-        def raw_fallback() -> str:
+        fallback_action = "using raw checkpoint" if allow_raw_fallback else "aborting staged compaction"
+
+        def raw_fallback() -> str | None:
+            if not allow_raw_fallback:
+                return None
             return self._raw_checkpoint(
                 source_messages,
                 session_key=session_key,
@@ -878,27 +892,23 @@ class MemoryArchiver:
                 *[dict(message) for message in history],
                 prompt_message,
             ]
-        if input_token_budget is not None and provider_context is None:
-            estimated, source = estimate_prompt_tokens_chain(
-                runtime.provider,
-                runtime.model,
-                request_messages,
-                call_tools,
-            )
-            if input_token_budget <= 0 or estimated > input_token_budget:
-                logger.debug(
-                    "Memory archive input does not fit for {}: {}/{} via {}; "
-                    "using raw checkpoint",
-                    session_key,
-                    estimated,
-                    input_token_budget,
-                    source,
-                )
-                return raw_fallback()
-
         response: LLMResponse | None = None
         for attempt in range(2):
+            if input_token_budget is not None and provider_context is None and (
+                attempt == 0 or not allow_raw_fallback
+            ):
+                estimated, source = estimate_prompt_tokens_chain(
+                    runtime.provider, runtime.model, request_messages, call_tools,
+                )
+                if input_token_budget <= 0 or estimated > input_token_budget:
+                    logger.debug(
+                        "Memory archive input does not fit for {}: {}/{} via {}; {}",
+                        session_key, estimated, input_token_budget, source, fallback_action,
+                    )
+                    return raw_fallback()
             try:
+                if telemetry is not None:
+                    telemetry.provider_calls += 1
                 with llm_usage_source("dream"):
                     response = await runtime.provider.chat_stream_with_retry(
                         model=runtime.model,
@@ -919,21 +929,14 @@ class MemoryArchiver:
                     )
             except Exception:
                 phase = "provider call" if attempt == 0 else "tool-call recovery"
-                logger.warning(
-                    "Memory archive {} failed; using raw checkpoint",
-                    phase,
-                )
-                if telemetry is not None:
-                    telemetry.provider_calls += 1
+                logger.warning("Memory archive {} failed; {}", phase, fallback_action)
                 return raw_fallback()
-            if telemetry is not None:
-                telemetry.provider_calls += 1
-                if response.usage is not None:
-                    telemetry.usage = (
-                        response.usage
-                        if telemetry.usage is None
-                        else telemetry.usage + response.usage
-                    )
+            if telemetry is not None and response.usage is not None:
+                telemetry.usage = (
+                    response.usage
+                    if telemetry.usage is None
+                    else telemetry.usage + response.usage
+                )
             if response.should_execute_tools is not True or attempt == 1 or not request_tools:
                 # Tool-free requests (a configured compactor, or a session
                 # without tools) never recover: echoing an unsolicited
@@ -986,21 +989,21 @@ class MemoryArchiver:
         assert response is not None
         if response.finish_reason in {"error", "length"}:
             logger.warning(
-                "Memory archive provider did not complete ({}); using raw checkpoint",
-                response.finish_reason,
+                "Memory archive provider did not complete ({}); {}",
+                response.finish_reason, fallback_action,
             )
             return raw_fallback()
         if response.has_tool_calls is True:
-            logger.warning("Memory archive provider returned tool calls; using raw checkpoint")
+            logger.warning("Memory archive provider returned tool calls; {}", fallback_action)
             return raw_fallback()
         summary = response.content
         if not summary or not summary.strip():
-            logger.warning("Memory archive provider returned no summary; using raw checkpoint")
+            logger.warning("Memory archive provider returned no summary; {}", fallback_action)
             return raw_fallback()
         summary = self.store._normalize_history_entry(summary)
         if not summary:
             logger.warning(
-                "Memory archive provider summary was not safe to replay; using raw checkpoint"
+                "Memory archive provider summary was not safe to replay; {}", fallback_action
             )
             return raw_fallback()
         if persist and summary != "(nothing)":
@@ -1102,17 +1105,29 @@ class MemoryArchiver:
 
 
 @dataclass
+class CompactionStageReport:
+    """One summarizer stage of a staged compaction attempt."""
+
+    stage: int
+    elapsed_s: float = 0.0
+    provider_calls: int = 0
+    usage: LLMUsage | None = None
+
+
+@dataclass
 class CompactionCallTelemetry:
     """Measure the summarizer calls behind one compaction attempt.
 
     Filled in by :meth:`MemoryArchiver.archive` so a dry-run preview can
     report provider usage and distinguish an LLM summary from a locally
-    built raw checkpoint.
+    built raw checkpoint. Staged compaction aggregates one report per
+    stage into ``stages`` and the totals into the other fields.
     """
 
     provider_calls: int = 0
     usage: LLMUsage | None = None
     raw_fallback: bool = False
+    stages: list[CompactionStageReport] = field(default_factory=list)
 
 
 @dataclass
@@ -1120,10 +1135,11 @@ class CompactionPlan:
     """Archive boundary chosen for one session compaction attempt.
 
     ``prefix`` is ``None`` on the legacy full-prefix path, where the whole
-    raw unarchived suffix is archived. ``skipped`` marks the verbatim-tail
-    no-op that session compaction reports instead of archiving; in that case
-    ``skip_no_capacity`` says whether the compactor's budget could not be
-    derived at all.
+    raw unarchived suffix is archived. ``stages`` is ``None`` for the single
+    summarizer call; a non-None value partitions the prepared prefix into
+    consecutive stages that each fit one compactor request, summarized
+    chronologically with a carry-forward summary. ``skip_reason`` marks a
+    sizing no-op rather than a legacy full-prefix archive.
     """
 
     session: Session
@@ -1132,8 +1148,9 @@ class CompactionPlan:
     archive_end: int
     prefix: list[dict[str, Any]] | None = None
     unarchived_count: int = 0
-    skipped: bool = False
-    skip_no_capacity: bool = False
+    skip_reason: str | None = None
+    replay_config: ContextGovernanceConfig | None = None
+    stages: list[list[dict[str, Any]]] | None = None
 
 
 @dataclass
@@ -1153,6 +1170,7 @@ class CompactionPreview:
     estimated_prompt_tokens: int = 0
     estimated_summary_tokens: int = 0
     estimated_prompt_tokens_after: int = 0
+    stages: list[CompactionStageReport] = field(default_factory=list)
 
 
 def min_tail_skip_marker(
@@ -1171,6 +1189,11 @@ class Consolidator:
     """Coordinate session Memory checkpoints through ``MemoryArchiver``."""
 
     _SAFETY_BUFFER = 1024  # extra headroom for tokenizer estimation drift
+    # Finite staged-compaction policy: at most this many summarizer stages per
+    # attempt, within this wall-clock budget for all summarizer calls.
+    _STAGED_MAX_STAGES = 8
+    _STAGED_MAX_SECONDS: float = 1800
+    _STAGED_BOUNDARY_PROBES = 4  # Exact sizing probes per stage, newest legal cut first.
 
     def __init__(
         self,
@@ -1374,6 +1397,16 @@ class Consolidator:
             telemetry=telemetry,
         )
 
+    def _session_replay_wrapper(self, session: Session, summary: str) -> list[dict[str, Any]]:
+        channel = session.key.split(":", 1)[0] if ":" in session.key else None
+        workspace = None
+        if self._resolve_prompt_context is not None:
+            channel, workspace = self._resolve_prompt_context(session)
+        return self._build_messages(
+            history=[], current_message=None, channel=channel, workspace=workspace,
+            session_summary={"text": summary, "last_active": session.updated_at.isoformat()},
+        )
+
     def _session_prefix_cut(
         self,
         session: Session,
@@ -1382,47 +1415,100 @@ class Consolidator:
         previous_summary: str | None,
         runtime: LLMRuntime,
         tools: list[dict[str, Any]] | None,
-    ) -> tuple[int, list[dict[str, Any]]] | None:
+    ) -> tuple[int, list[dict[str, Any]] | None, list[list[dict[str, Any]]] | None] | None:
+        """Choose one replay boundary and size a single request before staging it."""
         history = session.get_history()
-        channel = session.key.split(":", 1)[0] if ":" in session.key else None
-        workspace = None
-        if self._resolve_prompt_context is not None:
-            channel, workspace = self._resolve_prompt_context(session)
-        wrapper = self._build_messages(
-            history=[], current_message=None, channel=channel, workspace=workspace,
-            session_summary={"text": "", "last_active": session.updated_at.isoformat()},
-        )
-        raw = [*wrapper, *history]
         cut = self._context_governor.select_prefix_cut(
-            config, raw, len(raw), budget,
-            wrapper, previous_summary, [], config.tools.get_definitions(),
-            session_compaction=True,
+            config, history, len(history), budget, self._session_replay_wrapper(session, ""),
+            None, [], config.tools.get_definitions(), session_compaction=True,
             next_turn_input_reserve_tokens=config.next_turn_input_reserve_tokens,
+            check_prefix_capacity=False,
         )
         if cut is None:
             return None
-        position = cut - len(wrapper)
-        archive_end = session.message_index_at_history_position(position)
+
+        archive_end = session.message_index_at_history_position(cut)
         assert archive_end is not None  # The cut indexes the same untrimmed replay view.
-        prefix = history[:position]
+        prefix = self._context_governor.prepare_messages_for_model(config, history[:cut])
+        request_tools = self._get_tool_definitions() if tools is None else tools
+        single_request = prefix
         if previous_summary:
-            prefix.insert(0, {
-                "role": "system", "content": f"Previous conversation summary:\n{previous_summary}",
-            })
-        prefix = self._context_governor.prepare_messages_for_model(config, prefix)
-        if config.min_verbatim_tail_tokens > 0:
-            # The selector's additive estimate is a first pass. Verify the
-            # actual compactor prompt before allowing the archiver's fallback.
-            archive_count = sum(message.get("role") != "system" for message in prefix)
-            if not archive_count:
-                return None
+            single_request = [
+                {"role": "system", "content": f"Previous conversation summary:\n{previous_summary}"},
+                *prefix,
+            ]
+        archive_count = sum(message.get("role") != "system" for message in prefix)
+        if archive_count:
             estimated, _ = estimate_prompt_tokens_chain(
-                runtime.provider, runtime.model, [*prefix, _archive_prompt(archive_count)],
-                self._get_tool_definitions() if tools is None else tools,
+                runtime.provider, runtime.model,
+                [*single_request, _archive_prompt(archive_count)], request_tools,
             )
-            if estimated > budget.input_budget:
+            if estimated <= budget.input_budget:
+                return archive_end, single_request, None
+        stages = self._partition_stages(prefix, previous_summary, budget, runtime, request_tools)
+        return archive_end, None, stages
+
+    @staticmethod
+    def _with_stage_carry(messages: list[dict[str, Any]], summary: str | None) -> list[dict[str, Any]]:
+        if not summary:
+            return messages
+        # Match the checkpoint merger's existing prompt contract.
+        return [{"role": "system", "content": f"[Archived Context Summary]\n\n{summary}"}, *messages]
+
+    def _partition_stages(
+        self,
+        prefix: list[dict[str, Any]],
+        previous_summary: str | None,
+        budget: CompactorInputBudget,
+        runtime: LLMRuntime,
+        request_tools: list[dict[str, Any]],
+    ) -> list[list[dict[str, Any]]] | None:
+        """Bound the plan using both actual request overhead and a carry reserve."""
+        carry_wrapper, _ = estimate_prompt_tokens_chain(
+            runtime.provider, runtime.model, self._with_stage_carry([], " "), None,
+        )
+        first_carry_cost = 0
+        if previous_summary:
+            first_carry_cost, _ = estimate_prompt_tokens_chain(
+                runtime.provider, runtime.model, self._with_stage_carry([], previous_summary), None,
+            )
+        carry_reserve = carry_wrapper + budget.max_summary_tokens
+        base_capacity = budget.input_budget - budget.fixed_overhead_tokens
+        legal = self._context_governor.legal_cut_indices(prefix, len(prefix))
+        costs = [estimate_message_tokens(message) for message in prefix]
+        stages: list[list[dict[str, Any]]] = []
+        start = 0
+        while start < len(prefix):
+            stage_capacity = base_capacity - (carry_reserve if start else first_carry_cost)
+            candidates: deque[int] = deque(maxlen=self._STAGED_BOUNDARY_PROBES)
+            used = 0
+            for candidate in range(start + 1, len(prefix) + 1):
+                used += costs[candidate - 1]
+                if used > stage_capacity:
+                    break
+                if candidate == len(prefix) or legal[candidate]:
+                    candidates.append(candidate)
+            # The additive estimate can undercount the projected request. Try
+            # a bounded number of earlier legal cuts rather than probing every
+            # prefix or giving up at the first mismatch.
+            for end in reversed(candidates):
+                stage = prefix[start:end]
+                count = sum(message.get("role") != "system" for message in stage)
+                if not count:
+                    return None  # Shorter prefixes would also have no archive source.
+                request = self._with_stage_carry(stage, previous_summary) if start == 0 else stage
+                estimated, _ = estimate_prompt_tokens_chain(
+                    runtime.provider, runtime.model, [*request, _archive_prompt(count)], request_tools,
+                )
+                if estimated + (carry_reserve if start else 0) <= budget.input_budget:
+                    stages.append(stage)
+                    start = end
+                    break
+            else:
                 return None
-        return archive_end, prefix
+            if len(stages) == self._STAGED_MAX_STAGES and start < len(prefix):
+                return None
+        return stages if len(stages) > 1 else None
 
     async def plan_idle_compaction(
         self,
@@ -1460,16 +1546,22 @@ class Consolidator:
             )
             if replay_config is not None and budget is not None else None
         )
-        skipped = (
-            replay_config is not None
-            and replay_config.min_verbatim_tail_tokens > 0
-            and cut is None
-        )
+        skip_reason = None
         if cut is None:
             archive_end = archive_start + len(messages_to_archive)
             prefix = None
+            stages = None
+            if replay_config is not None and replay_config.min_verbatim_tail_tokens > 0:
+                skip_reason = (
+                    "the compactor's input capacity cannot be derived for the verbatim-tail policy"
+                    if budget is None else
+                    f"no compaction fit while keeping the configured minimum of "
+                    f"{replay_config.min_verbatim_tail_tokens} verbatim tail tokens"
+                )
         else:
-            archive_end, prefix = cut
+            archive_end, prefix, stages = cut
+            if prefix is None and stages is None:
+                skip_reason = "the protected prefix exceeds the bounded compactor capacity"
         unarchived_count = sum(
             1 for message in messages_to_archive
             if not message.get("_command") and not is_summary_checkpoint(message)
@@ -1481,8 +1573,9 @@ class Consolidator:
             archive_end=archive_end,
             prefix=prefix,
             unarchived_count=unarchived_count,
-            skipped=skipped,
-            skip_no_capacity=skipped and budget is None,
+            skip_reason=skip_reason,
+            replay_config=replay_config,
+            stages=stages,
         )
 
     async def _execute_compaction(
@@ -1497,6 +1590,16 @@ class Consolidator:
         telemetry: CompactionCallTelemetry | None = None,
     ) -> str | None:
         """Run the summarizer for a planned compaction at the plan's exact boundary."""
+        if plan.stages is not None:
+            try:
+                async with asyncio.timeout(self._STAGED_MAX_SECONDS):
+                    return await self._summarize_stages(
+                        plan, runtime=runtime, session_key=session_key, tools=tools,
+                        no_tool_contract=no_tool_contract, telemetry=telemetry,
+                    )
+            except TimeoutError:
+                logger.warning("Staged compaction timed out for {}; retaining history", session_key)
+                return None
         if plan.prefix is not None:
             return await self.summarize_transcript(
                 plan.prefix, plan.previous_summary, runtime=runtime, session_key=session_key,
@@ -1509,6 +1612,107 @@ class Consolidator:
             no_tool_contract=no_tool_contract,
             persist=persist, telemetry=telemetry,
         )
+
+    async def _summarize_stages(
+        self,
+        plan: CompactionPlan,
+        *,
+        runtime: LLMRuntime,
+        session_key: str,
+        tools: list[dict[str, Any]] | None,
+        no_tool_contract: bool,
+        telemetry: CompactionCallTelemetry | None,
+    ) -> str | None:
+        """Run every stage without publishing anything until the caller commits."""
+        stages = plan.stages
+        assert stages is not None
+        request_tools = self._get_tool_definitions() if tools is None else tools
+        input_budget = runtime.context_window_tokens - max(0, runtime.generation.max_tokens)
+        carry = plan.previous_summary
+        for index, stage in enumerate(stages, start=1):
+            stage_messages = self._with_stage_carry(stage, carry)
+            stage_telemetry = CompactionCallTelemetry()
+            stage_started = time.monotonic()
+            try:
+                summary = await self.archiver.archive(
+                    [dict(message) for message in stage_messages if message.get("role") != "system"],
+                    runtime=runtime,
+                    session_key=session_key,
+                    history=[dict(message) for message in stage_messages],
+                    request_tools=request_tools,
+                    previous_summary=None,
+                    input_token_budget=input_budget,
+                    no_tool_contract=no_tool_contract,
+                    persist=False,
+                    telemetry=stage_telemetry,
+                    allow_raw_fallback=False,
+                )
+            finally:
+                stage_elapsed = time.monotonic() - stage_started
+                if telemetry is not None:
+                    telemetry.stages.append(CompactionStageReport(
+                        stage=index,
+                        elapsed_s=stage_elapsed,
+                        provider_calls=stage_telemetry.provider_calls,
+                        usage=stage_telemetry.usage,
+                    ))
+                    telemetry.provider_calls += stage_telemetry.provider_calls
+                    if stage_telemetry.usage is not None:
+                        telemetry.usage = (
+                            stage_telemetry.usage
+                            if telemetry.usage is None
+                            else telemetry.usage + stage_telemetry.usage
+                        )
+            if summary is None:
+                logger.warning(
+                    "Staged compaction for {} failed at stage {}/{}; retaining the original history",
+                    session_key, index, len(stages),
+                )
+                return None
+            carry = summary
+        assert carry is not None
+        if not await self._context_governor.prepare_in_background(self._staged_replay_fits, plan, carry):
+            logger.warning("Staged checkpoint would exceed the replay budget for {}; retaining history", session_key)
+            return None
+        return carry
+
+    def _staged_replay_fits(self, plan: CompactionPlan, summary: str) -> bool:
+        config = plan.replay_config
+        assert config is not None  # Staging requires a bounded replay plan.
+        projected = self._project_checkpoint(plan, summary)
+        probe = self._context_governor.prepare_messages_for_model(config, [
+            *self._session_replay_wrapper(plan.session, summary),
+            *projected.get_history(),
+            {"role": "user", "content": SUMMARY_CONTINUATION_TEXT},
+        ])
+        estimated, _ = estimate_prompt_tokens_chain(
+            config.provider, config.model, probe, config.tools.get_definitions(),
+        )
+        return (
+            estimated + max(0, config.next_turn_input_reserve_tokens)
+            <= self._context_governor.input_budget(config)
+        )
+
+    @staticmethod
+    def _project_checkpoint(plan: CompactionPlan, summary: str) -> Session:
+        session = plan.session
+        projected = dataclasses_replace(session, messages=list(session.messages), metadata=dict(session.metadata))
+        projected.commit_summary_checkpoint(summary, insert_at=plan.archive_end, last_active=session.updated_at)
+        return projected
+
+    async def _commit_staged_summary(self, plan: CompactionPlan, summary: str) -> None:
+        await self.sessions.state.commit_summary(plan.session, summary, archive_end=plan.archive_end)
+        if summary != "(nothing)":
+            try:
+                self.store.append_history(summary, session_key=plan.session.key)
+            except OSError:
+                # The journal and its cursor are separate from the session
+                # transaction. An append can fail after writing the entry;
+                # don't retry it or report that the checkpoint was rolled back.
+                logger.opt(exception=True).warning(
+                    "Staged checkpoint applied for {} but updating the memory journal failed",
+                    plan.session.key,
+                )
 
     async def compact_idle_session(
         self,
@@ -1562,7 +1766,7 @@ class Consolidator:
 
             if plan is None:
                 return ""
-            if plan.skipped:
+            if plan.skip_reason:
                 # A normal no-op, not a failure or a full-prefix archive.
                 # Remember it for idle scans only while the history and sizing policy match.
                 marker = min_tail_skip_marker(session, runtime, replay_config)
@@ -1574,8 +1778,7 @@ class Consolidator:
                     except Exception:
                         logger.debug("Could not record min-tail skip marker for {}", session_key, exc_info=True)
                 logger.info(
-                    "Skipping session compaction for {}: no cut keeps the {}-token verbatim tail",
-                    session_key, replay_config.min_verbatim_tail_tokens,
+                    "Skipping session compaction for {}: {}", session_key, plan.skip_reason,
                 )
                 return ""
 
@@ -1585,10 +1788,12 @@ class Consolidator:
                     plan, runtime=runtime, session_key=session_key, tools=tools,
                     no_tool_contract=no_tool_contract,
                 )
-                if summary:
-                    await self.sessions.state.commit_summary(
-                        session, summary, archive_end=plan.archive_end,
-                    )
+                if summary and plan.stages is not None:
+                    # Once publication is accepted, finish the checkpoint and
+                    # best-effort journal update before propagating cancellation.
+                    await shield_and_drain(self._commit_staged_summary(plan, summary))
+                elif summary:
+                    await self.sessions.state.commit_summary(session, summary, archive_end=plan.archive_end)
             except (Exception, asyncio.CancelledError) as exc:
                 await events.emit(
                     ContextCompactionEvent(
@@ -1615,12 +1820,13 @@ class Consolidator:
             )
 
             logger.info(
-                "Session compact for {}: archived={}, replay_tail={}, retained={}, summary={}",
+                "Session compact for {}: archived={}, replay_tail={}, retained={}, summary={}, stages={}",
                 session_key,
                 plan.archive_end - plan.archive_start,
                 len(session.messages) - plan.archive_end,
                 len(session.messages),
                 bool(summary),
+                len(plan.stages) if plan.stages is not None else 1,
             )
 
             return summary
@@ -1639,7 +1845,7 @@ class Consolidator:
 
         Shares :meth:`plan_idle_compaction` and :meth:`_execute_compaction`
         with :meth:`compact_idle_session`, so it runs the same preflight and
-        the exact same summarizer request; the configured compactor is called
+        the same summarizer requests; the configured compactor is called
         for real, so provider inference and its cost can occur. The only
         differences are the publication effects: no summary commit,
         history-journal entry, skip marker, or lifecycle event, and no
@@ -1665,14 +1871,9 @@ class Consolidator:
             preview.estimated_prompt_tokens, _ = self.estimate_session_prompt_tokens(
                 session, runtime=replay_runtime,
             )
-            if plan.skipped:
+            if plan.skip_reason:
                 preview.outcome = "skipped"
-                preview.reason = (
-                    "the compactor's input capacity cannot be derived for the verbatim-tail policy"
-                    if plan.skip_no_capacity else
-                    f"no compaction fit while keeping the configured minimum of "
-                    f"{replay_config.min_verbatim_tail_tokens} verbatim tail tokens"
-                )
+                preview.reason = plan.skip_reason
                 return preview
 
             preview.archived_count = plan.archive_end - plan.archive_start
@@ -1690,16 +1891,18 @@ class Consolidator:
                 logger.exception("Compaction dry run failed for {}", session_key)
                 preview.outcome = "error"
                 preview.reason = type(exc).__name__
+                return preview
+            finally:
                 preview.elapsed_s = time.monotonic() - started
                 preview.usage = telemetry.usage
                 preview.provider_calls = telemetry.provider_calls
-                return preview
-            preview.elapsed_s = time.monotonic() - started
-            preview.usage = telemetry.usage
-            preview.provider_calls = telemetry.provider_calls
+                preview.stages = telemetry.stages
             if not summary:
                 preview.outcome = "error"
-                preview.reason = "the compactor produced no checkpoint"
+                preview.reason = (
+                    "staged compaction could not finish safely; the original history was retained"
+                    if plan.stages is not None else "the compactor produced no checkpoint"
+                )
                 return preview
 
             preview.summary = summary
@@ -1710,10 +1913,7 @@ class Consolidator:
             )
             # Project the post-compaction replay on a throwaway copy, exactly as
             # commit_summary_checkpoint would; nothing is written for it.
-            projected = dataclasses_replace(
-                session, messages=list(session.messages), metadata=dict(session.metadata),
-            )
-            projected.commit_summary_checkpoint(summary, insert_at=plan.archive_end)
+            projected = self._project_checkpoint(plan, summary)
             preview.estimated_prompt_tokens_after, _ = self.estimate_session_prompt_tokens(
                 projected, runtime=replay_runtime,
             )

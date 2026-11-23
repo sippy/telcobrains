@@ -645,7 +645,7 @@ class ContextGovernor:
         )
 
     @staticmethod
-    def _legal_cut_indices(raw: list[dict[str, Any]], boundary: int) -> list[bool]:
+    def legal_cut_indices(raw: list[dict[str, Any]], boundary: int) -> list[bool]:
         """Mark raw indices where the tail starting there keeps every tool pair whole.
 
         A tail ``raw[i:boundary]`` is legal when each tool result it contains
@@ -715,6 +715,7 @@ class ContextGovernor:
         *,
         session_compaction: bool = False,
         next_turn_input_reserve_tokens: int = 0,
+        check_prefix_capacity: bool = True,
     ) -> int | None:
         """Choose the oldest raw prefix to compact, protecting a verbatim tail.
 
@@ -729,6 +730,15 @@ class ContextGovernor:
         summary). Any newer cut compacts a larger prefix, so when the most
         protective cut fails the compactor budget no useful cut exists. If
         either budget check fails, the caller chooses its usual fallback.
+        Session callers may disable the additive prefix check and instead size
+        the exact prefix request or partition it into separately sized stages.
+
+        ``raw`` is the transcript being compacted, supplied without the
+        post-compaction replay wrapper. The *wrapper* is only the replay
+        prefix the next request carries after compaction, so it is charged
+        against the replay headroom (and the probe) but never against the
+        compactor's prefix capacity, whose request is the prepared prefix
+        plus the summarization prompt.
 
         A legal boundary does not split a tool call from its result. In-turn
         compaction may cut at any legal boundary. Session compaction cuts at
@@ -743,7 +753,7 @@ class ContextGovernor:
         protected tail (or yields no cut) but never reduces compactor
         capacity, and in-turn compaction with a real delta does not pass it.
         """
-        if budget is None or not config.context_window_tokens or delta_start < 3:
+        if budget is None or not config.context_window_tokens or delta_start < (2 if session_compaction else 3):
             return None
         input_budget = self.input_budget(config)
         if input_budget <= 0:
@@ -792,18 +802,18 @@ class ContextGovernor:
         prefix_capacity = (
             budget.input_budget - budget.fixed_overhead_tokens - prior_summary_cost
         )
-        if prefix_capacity <= 0:
+        if check_prefix_capacity and prefix_capacity <= 0:
             return None
 
         floor = config.min_verbatim_tail_tokens if session_compaction else 0
         # A positive session floor counts only replayable history and must
         # still leave a nonempty history prefix to summarize.
-        first_cut = max(2, len(wrapper) + 1) if floor > 0 else 2
+        first_cut = 1 if session_compaction else 2
         if floor > tail_budget or first_cut >= delta_start:
             return None
-        legal = self._legal_cut_indices(raw, delta_start)
+        legal = self.legal_cut_indices(raw, delta_start)
         costs = [estimate_message_tokens(message) for message in raw[:delta_start]]
-        if floor > 0 and sum(costs[len(wrapper):]) <= floor:
+        if floor > 0 and sum(costs) <= floor:
             return None
         total_cost = sum(costs)
         cut: int | None = None
@@ -820,7 +830,7 @@ class ContextGovernor:
             ):
                 cut = index
                 cut_tail_cost = tail_cost
-        if cut is None or total_cost - cut_tail_cost > prefix_capacity:
+        if cut is None or (check_prefix_capacity and total_cost - cut_tail_cost > prefix_capacity):
             return None
         if find_legal_message_start(raw[cut:delta_start]) != 0:
             return None

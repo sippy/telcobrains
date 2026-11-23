@@ -6,7 +6,7 @@ Use these slash commands inside the WebUI, terminal chat, or connected chat apps
 |---------|-------------|
 | `/new` | Stop the current task and start a new conversation |
 | `/compact` | Summarize the current conversation context while keeping saved chat history |
-| `/compact --dry-run` | Test-run compaction: the compactor runs the real summarization once and the result is discarded; reports the outcome without changing the chat (only the command reply is stored; provider inference can still occur) |
+| `/compact --dry-run` | Test-run compaction, including any staged summarization, and discard the result. Reports the outcome, timing, and available token usage; only the command reply is stored and provider inference can still occur. |
 | `/stop` | Stop the current task without cancelling its saved goal |
 | `/goal <task>` | Start a sustained goal for this conversation |
 | `/cancel_goal` | Cancel the active or blocked goal (also stops work on an active goal) |
