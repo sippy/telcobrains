@@ -22,12 +22,16 @@ from uuid import uuid4
 
 from loguru import logger
 
-from nanobot.agent.context_governance import ContextGovernanceConfig, ContextGovernor
+from nanobot.agent.context_governance import (
+    ContextGovernanceConfig,
+    ContextGovernor,
+    PrefixCutResult,
+)
 from nanobot.config.paths import DREAM_CURSOR_PATH, MEMORY_CURSOR_PATH, MEMORY_JOURNAL_PATH
 from nanobot.events import NO_EVENTS, CompactionReason, ContextCompactionEvent, EventSink
 from nanobot.llm_usage.context import llm_usage_source
 from nanobot.llm_usage.types import LLMUsage
-from nanobot.providers.base import LLMResponse, ProviderConversationState
+from nanobot.providers.base import LLMProvider, LLMResponse, ProviderConversationState
 from nanobot.providers.conversation_state import ProviderConversationStateController
 from nanobot.runtime_context import public_history_messages
 from nanobot.session.manager import Session, SessionManager
@@ -61,6 +65,11 @@ from nanobot.utils.workspace_prompts import (
 if TYPE_CHECKING:
     from nanobot.agent.tools.registry import ToolRegistry
     from nanobot.utils.llm_runtime import LLMRuntime
+
+# "sdk" is a logging-only trigger: SDK compactions run the same lifecycle,
+# but wire events keep the client-facing CompactionReason set, so events map
+# it to no reason.
+CompactionTrigger = CompactionReason | Literal["sdk"]
 
 
 class MemoryStore:
@@ -1153,6 +1162,22 @@ class CompactionPlan:
     stages: list[list[dict[str, Any]]] | None = None
 
 
+@dataclass(frozen=True)
+class _SessionPrefixCut:
+    """One session replay boundary sized for the compactor.
+
+    ``planner`` is the shared planner's result: ``planner.cut`` is ``None``
+    when no boundary was selected, and ``planner.reason`` then carries the
+    stable no-cut code (for instance ``below_floor`` when the replayable
+    history already fits under the configured verbatim-tail floor).
+    """
+
+    archive_end: int | None
+    prefix: list[dict[str, Any]] | None
+    stages: list[list[dict[str, Any]]] | None
+    planner: PrefixCutResult
+
+
 @dataclass
 class CompactionPreview:
     """Outcome of one dry-run compaction whose checkpoint was discarded."""
@@ -1348,6 +1373,19 @@ class Consolidator:
         runtime: LLMRuntime,
     ) -> tuple[int, str]:
         """Estimate prompt size from the full replayable session history."""
+        return self._session_prompt_probe(session, runtime.provider, runtime.model)
+
+    def _session_prompt_probe(
+        self,
+        session: Session,
+        provider: LLMProvider,
+        model: str,
+    ) -> tuple[int, str]:
+        """Estimate one full replay prompt locally, without provider inference.
+
+        Same wrapper, tools, and history projection for any two views of the
+        session, so before/after figures stay comparable.
+        """
         history = session.get_text_history()
         channel = session.key.split(":", 1)[0] if ":" in session.key else None
         summary = session_summary_from_metadata(
@@ -1361,8 +1399,8 @@ class Consolidator:
             session_summary=summary,
         )
         return estimate_prompt_tokens_chain(
-            runtime.provider,
-            runtime.model,
+            provider,
+            model,
             probe_messages,
             self._get_tool_definitions(),
         )
@@ -1415,21 +1453,21 @@ class Consolidator:
         previous_summary: str | None,
         runtime: LLMRuntime,
         tools: list[dict[str, Any]] | None,
-    ) -> tuple[int, list[dict[str, Any]] | None, list[list[dict[str, Any]]] | None] | None:
+    ) -> _SessionPrefixCut:
         """Choose one replay boundary and size a single request before staging it."""
         history = session.get_history()
-        cut = self._context_governor.select_prefix_cut(
+        planner = self._context_governor.select_prefix_cut(
             config, history, len(history), budget, self._session_replay_wrapper(session, ""),
             None, [], config.tools.get_definitions(), session_compaction=True,
             next_turn_input_reserve_tokens=config.next_turn_input_reserve_tokens,
             check_prefix_capacity=False,
         )
-        if cut is None:
-            return None
+        if planner.cut is None:
+            return _SessionPrefixCut(archive_end=None, prefix=None, stages=None, planner=planner)
 
-        archive_end = session.message_index_at_history_position(cut)
+        archive_end = session.message_index_at_history_position(planner.cut)
         assert archive_end is not None  # The cut indexes the same untrimmed replay view.
-        prefix = self._context_governor.prepare_messages_for_model(config, history[:cut])
+        prefix = self._context_governor.prepare_messages_for_model(config, history[:planner.cut])
         request_tools = self._get_tool_definitions() if tools is None else tools
         single_request = prefix
         if previous_summary:
@@ -1444,9 +1482,13 @@ class Consolidator:
                 [*single_request, _archive_prompt(archive_count)], request_tools,
             )
             if estimated <= budget.input_budget:
-                return archive_end, single_request, None
+                return _SessionPrefixCut(
+                    archive_end=archive_end, prefix=single_request, stages=None, planner=planner,
+                )
         stages = self._partition_stages(prefix, previous_summary, budget, runtime, request_tools)
-        return archive_end, None, stages
+        return _SessionPrefixCut(
+            archive_end=archive_end, prefix=None, stages=stages, planner=planner,
+        )
 
     @staticmethod
     def _with_stage_carry(messages: list[dict[str, Any]], summary: str | None) -> list[dict[str, Any]]:
@@ -1551,17 +1593,61 @@ class Consolidator:
             archive_end = archive_start + len(messages_to_archive)
             prefix = None
             stages = None
-            if replay_config is not None and replay_config.min_verbatim_tail_tokens > 0:
+            if (
+                replay_config is not None
+                and replay_config.min_verbatim_tail_tokens > 0
+                and budget is None
+            ):
                 skip_reason = (
                     "the compactor's input capacity cannot be derived for the verbatim-tail policy"
-                    if budget is None else
-                    f"no compaction fit while keeping the configured minimum of "
-                    f"{replay_config.min_verbatim_tail_tokens} verbatim tail tokens"
                 )
         else:
-            archive_end, prefix, stages = cut
-            if prefix is None and stages is None:
+            # A planner rejection keeps the legacy full-range archive boundary
+            # (or a floor no-op); a chosen cut fixes the exact archive end.
+            archive_end = (
+                cut.archive_end
+                if cut.archive_end is not None
+                else archive_start + len(messages_to_archive)
+            )
+            prefix, stages = cut.prefix, cut.stages
+            floor = replay_config.min_verbatim_tail_tokens
+            if cut.planner.cut is not None and prefix is None and stages is None:
                 skip_reason = "the protected prefix exceeds the bounded compactor capacity"
+            elif cut.planner.cut is None and floor > 0:
+                if cut.planner.reason == "below_floor":
+                    # A no-op by design, not a budget rejection: the whole
+                    # replayable history already fits under the floor.
+                    skip_reason = (
+                        f"est. {cut.planner.history_tokens} replayable tokens, at or below the "
+                        f"configured {floor}-token verbatim-tail floor; nothing to archive"
+                    )
+                elif cut.planner.reason == "replay_over_budget":
+                    # The skip line carries the estimate/budget diagnostics so
+                    # the rejection is not logged twice.
+                    skip_reason = (
+                        "no projected replay fit within the foreground input budget "
+                        f"(last: {cut.planner.last_required_tokens} > "
+                        f"{cut.planner.input_budget_tokens} tokens including summary and reserve; "
+                        f"{cut.planner.rejected_probes} request(s) probed)"
+                    )
+                else:
+                    skip_reason = (
+                        "no compaction fit while keeping the configured minimum of "
+                        f"{floor} verbatim tail tokens"
+                    )
+            elif (
+                cut.planner.cut is None
+                and cut.planner.reason == "replay_over_budget"
+                and skip_reason is None
+            ):
+                # Floor disabled: the rejection falls back to full-prefix
+                # archival, so the diagnostics stay visible once here.
+                logger.info(
+                    "Session compaction replay rejected for {}: {} projected request(s) exceeded "
+                    "the foreground input budget (last: {} > {} tokens including summary and reserve)",
+                    session.key, cut.planner.rejected_probes,
+                    cut.planner.last_required_tokens, cut.planner.input_budget_tokens,
+                )
         unarchived_count = sum(
             1 for message in messages_to_archive
             if not message.get("_command") and not is_summary_checkpoint(message)
@@ -1700,6 +1786,18 @@ class Consolidator:
         projected.commit_summary_checkpoint(summary, insert_at=plan.archive_end, last_active=session.updated_at)
         return projected
 
+    def _projected_prompt_probe(
+        self,
+        plan: CompactionPlan,
+        summary: str,
+        provider: LLMProvider,
+        model: str,
+    ) -> tuple[int, str]:
+        """Estimate the post-compaction replay prompt on a throwaway projection."""
+        return self._session_prompt_probe(
+            self._project_checkpoint(plan, summary), provider, model,
+        )
+
     async def _commit_staged_summary(self, plan: CompactionPlan, summary: str) -> None:
         await self.sessions.state.commit_summary(plan.session, summary, archive_end=plan.archive_end)
         if summary != "(nothing)":
@@ -1725,7 +1823,7 @@ class Consolidator:
         replay_config: ContextGovernanceConfig | None = None,
         events: EventSink = NO_EVENTS,
         notify: bool = False,
-        reason: CompactionReason | None = None,
+        reason: CompactionTrigger | None = None,
     ) -> str | None:
         """Replace an old prefix with a summary, retaining a tail when both budgets permit.
 
@@ -1734,8 +1832,11 @@ class Consolidator:
         ``tools`` overrides the tool set offered to the summarizer; a
         configured compactor receives ``[]`` (no tool calls offered) with
         ``no_tool_contract`` set.
+        ``reason`` is the trigger for logs; ``"sdk"`` is logging-only and maps
+        to no reason on wire events.
         """
         lock = self.get_lock(session_key)
+        event_reason = None if reason == "sdk" else reason
         async with lock:
             await self.sessions.state.discard(session_key)
             session = await self.sessions.state.get(session_key)
@@ -1746,7 +1847,7 @@ class Consolidator:
             # propagating the error.
             compaction_id = uuid4().hex
             started = ContextCompactionEvent(
-                compaction_id=compaction_id, phase="started", notify=notify, reason=reason,
+                compaction_id=compaction_id, phase="started", notify=notify, reason=event_reason,
             )
             try:
                 plan = await self.plan_idle_compaction(
@@ -1759,7 +1860,7 @@ class Consolidator:
                         compaction_id=compaction_id,
                         phase="cancelled" if isinstance(exc, asyncio.CancelledError) else "failed",
                         notify=notify,
-                        reason=reason,
+                        reason=event_reason,
                     ),
                 )
                 raise
@@ -1778,9 +1879,25 @@ class Consolidator:
                     except Exception:
                         logger.debug("Could not record min-tail skip marker for {}", session_key, exc_info=True)
                 logger.info(
-                    "Skipping session compaction for {}: {}", session_key, plan.skip_reason,
+                    "Skipping session compaction for {}{}: {}",
+                    session_key,
+                    f" ({reason})" if reason is not None else "",
+                    plan.skip_reason,
                 )
                 return ""
+
+            # Best-effort replay sizing before publication: tokenization is
+            # offloaded, and sizing trouble only drops the metric, never the
+            # compaction (cancellation here is a real pre-publication
+            # cancellation and propagates as usual).
+            before_tokens: int | None = None
+            if replay_config is not None:
+                try:
+                    before_tokens, _ = await self._context_governor.prepare_in_background(
+                        self._session_prompt_probe, session, replay_config.provider, replay_config.model,
+                    )
+                except Exception:
+                    before_tokens = None
 
             await events.emit(started)
             try:
@@ -1800,13 +1917,15 @@ class Consolidator:
                         compaction_id=compaction_id,
                         phase="cancelled" if isinstance(exc, asyncio.CancelledError) else "failed",
                         notify=notify,
-                        reason=reason,
+                        reason=event_reason,
                     ),
                 )
                 raise
             if not summary:
                 await events.emit(
-                    ContextCompactionEvent(compaction_id=compaction_id, phase="failed", notify=notify, reason=reason),
+                    ContextCompactionEvent(
+                        compaction_id=compaction_id, phase="failed", notify=notify, reason=event_reason,
+                    ),
                 )
                 return None
 
@@ -1815,18 +1934,51 @@ class Consolidator:
                     compaction_id=compaction_id,
                     phase="succeeded",
                     notify=notify,
-                    reason=reason,
+                    reason=event_reason,
                 ),
             )
 
+            # Projected replay sizing after the success event: the checkpoint
+            # is committed and no lifecycle event follows it, so sizing trouble
+            # only drops the metric and cancellation propagates without
+            # re-reporting the outcome.
+            replay_metrics = ""
+            if replay_config is not None and before_tokens is not None and before_tokens > 0:
+                after_tokens: int | None = None
+                try:
+                    after_tokens, _ = await self._context_governor.prepare_in_background(
+                        self._projected_prompt_probe, plan, summary,
+                        replay_config.provider, replay_config.model,
+                    )
+                except Exception:
+                    after_tokens = None
+                if after_tokens is not None and after_tokens > 0:
+                    change = before_tokens - after_tokens
+                    if change > 0:
+                        replay_metrics = (
+                            f", est. replay prompt tokens {before_tokens} -> {after_tokens}, "
+                            f"saved {change} tokens ({change / before_tokens * 100:.0f}%)"
+                        )
+                    elif change < 0:
+                        replay_metrics = (
+                            f", est. replay prompt tokens {before_tokens} -> {after_tokens}, "
+                            f"added {-change} tokens ({-change / before_tokens * 100:.0f}%)"
+                        )
+                    else:
+                        replay_metrics = (
+                            f", est. replay prompt tokens {before_tokens} -> {after_tokens}, no change"
+                        )
+
             logger.info(
-                "Session compact for {}: archived={}, replay_tail={}, retained={}, summary={}, stages={}",
+                "Session compact for {}{}: archived={}, replay_tail={}, retained={}, summary={}, stages={}{}",
                 session_key,
+                f" ({reason})" if reason is not None else "",
                 plan.archive_end - plan.archive_start,
                 len(session.messages) - plan.archive_end,
                 len(session.messages),
                 bool(summary),
                 len(plan.stages) if plan.stages is not None else 1,
+                replay_metrics,
             )
 
             return summary

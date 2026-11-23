@@ -829,7 +829,10 @@ async def test_compact_dry_run_floor_skip_makes_no_provider_call(loop) -> None:
     )
 
     assert reply is not None
-    assert "- Outcome: skipped — no compaction fit while keeping the configured minimum of 90000 verbatim tail tokens" in reply.content
+    # A single short message sits at or below the floor: a no-op by design,
+    # not a budget rejection.
+    assert "- Outcome: skipped — est. " in reply.content
+    assert "at or below the configured 90000-token verbatim-tail floor; nothing to archive" in reply.content
     assert "- Model that would summarize: `test-model`" in reply.content
     assert "No summarizer call was made:" in reply.content
     loop.provider.chat_stream_with_retry.assert_not_awaited()

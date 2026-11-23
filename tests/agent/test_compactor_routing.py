@@ -7,6 +7,7 @@ Foreground turns and Dream keep their own runtimes.
 """
 
 import asyncio
+import re
 from datetime import datetime, timedelta
 from functools import partial
 from types import SimpleNamespace
@@ -26,6 +27,7 @@ from nanobot.agent.tools.registry import ToolRegistry
 from nanobot.bus.events import InboundMessage
 from nanobot.bus.queue import MessageBus
 from nanobot.config.schema import Config, ModelPresetConfig
+from nanobot.events import ContextCompactionEvent, EventSink
 from nanobot.llm_usage.types import LLMUsage
 from nanobot.providers import factory
 from nanobot.providers.base import (
@@ -38,7 +40,10 @@ from nanobot.providers.base import (
 from nanobot.providers.conversation_state import ProviderConversationStateController
 from nanobot.providers.factory import ProviderSnapshot
 from nanobot.sdk.clients import RuntimeClient
-from nanobot.session.summary import is_summary_checkpoint
+from nanobot.session.summary import (
+    SUMMARY_CONTINUATION_TEXT,
+    is_summary_checkpoint,
+)
 
 COMPACTOR_PRESET = ModelPresetConfig(
     model="compactor-model",
@@ -648,7 +653,7 @@ async def test_session_compaction_floor_skips_when_tail_below_floor(
                 runtime=loop.llm_runtime(),
             )
             assert reply is not None
-            assert reply.content == "Context unchanged: no compaction fit while keeping the configured minimum of recent history."
+            assert reply.content == "Context unchanged: nothing to compact while keeping the configured minimum of recent history."
             assert loop.bus.outbound_size == 0  # No compaction lifecycle events.
         elif trigger == "sdk":
             await RuntimeClient(loop).compact_session(key)
@@ -718,6 +723,190 @@ async def test_session_compaction_floor_proceeds_when_tail_meets_floor(
     await loop.aclose()
 
 
+@pytest.mark.parametrize("trigger", ["manual", "sdk"])
+async def test_session_compaction_below_floor_logs_no_op_with_estimate(tmp_path, monkeypatch, trigger) -> None:
+    # The six replayable messages cost exactly the 600-token floor, so the
+    # skip is a floor no-op carrying its estimate, not a "no compaction fit"
+    # rejection, and the log names the trigger.
+    monkeypatch.setattr(
+        "nanobot.agent.context_governance.estimate_message_tokens",
+        lambda message: 100,
+    )
+    foreground, loop = _make_loop(
+        tmp_path, context_window_tokens=12_000, fg_max_tokens=100,
+        min_verbatim_tail_tokens=600,
+    )
+    compactor = loop.compactor_runtime().provider
+    key = "cli:floor-noop"
+    _seed_floor_session(loop, key)
+
+    logs: list[str] = []
+    sink = logger.add(logs.append, level="INFO", format="{message}")
+    try:
+        if trigger == "manual":
+            await loop._process_message(
+                InboundMessage(channel="cli", sender_id="user", chat_id="floor-noop", content="/compact"),
+                runtime=loop.llm_runtime(),
+            )
+        else:
+            assert await RuntimeClient(loop).compact_idle_session(key) == ""
+        assert any(
+            f"Skipping session compaction for {key} ({trigger}): est. 600 replayable tokens, "
+            "at or below the configured 600-token verbatim-tail floor; nothing to archive"
+            in line for line in logs
+        )
+    finally:
+        logger.remove(sink)
+        await loop.aclose()
+
+    foreground.chat_stream_with_retry.assert_not_awaited()
+    compactor.chat_stream_with_retry.assert_not_awaited()
+
+
+async def test_sdk_compaction_maps_trigger_to_no_wire_reason(tmp_path) -> None:
+    # "sdk" is a logging-only trigger: lifecycle events keep the
+    # client-facing CompactionReason set, so the wire events carry no reason.
+    foreground, loop = _make_loop(tmp_path, context_window_tokens=200_000)
+    await _seed_idle_session(loop, key="cli:sdk-events")
+    session = loop.sessions.get_or_create("cli:sdk-events")
+    runtime, tools, no_tool_contract, replay_config = await loop.compaction_runtime_for_session(session)
+    events: list[ContextCompactionEvent] = []
+
+    async def collect(event) -> None:
+        events.append(event)
+
+    try:
+        summary = await loop.consolidator.compact_idle_session(
+            "cli:sdk-events",
+            runtime=runtime,
+            tools=tools,
+            no_tool_contract=no_tool_contract,
+            replay_config=replay_config,
+            events=EventSink(publish=collect),
+            reason="sdk",
+        )
+    finally:
+        await loop.aclose()
+
+    assert summary == "Checkpoint."
+    assert [event.phase for event in events] == ["started", "succeeded"]
+    assert all(event.reason is None for event in events)
+
+
+@pytest.mark.parametrize("trigger", ["manual", "scheduled_idle"])
+async def test_session_compaction_success_logs_replay_prompt_estimates(tmp_path, monkeypatch, trigger) -> None:
+    # Byte-sized probes make the before/after replay estimates deterministic:
+    # both views are sized with the same replay model, wrapper, tools, and
+    # projection, so the logged delta is the archived prefix minus the
+    # summary and continuation the replay gains.
+    def cost(message):
+        return 4 + sum(len(str(message.get(field, "")).encode()) for field in (
+            "content", "tool_calls", "tool_call_id", "name",
+        ))
+
+    for module in ("context_governance", "memory"):
+        monkeypatch.setattr(f"nanobot.agent.{module}.estimate_message_tokens", cost)
+    foreground, loop = _make_loop(
+        tmp_path, context_window_tokens=120_000, fg_max_tokens=100,
+        session_ttl_minutes=1,
+    )
+    foreground.estimate_prompt_tokens.side_effect = lambda messages, tools, model: (
+        sum(map(cost, messages)), "synthetic-byte-counter",
+    )
+    key = "cli:estimates"
+    session = loop.sessions.get_or_create(key)
+    session.add_message("user", "old question " + "x" * 4_000)
+    session.add_message("assistant", "old answer " + "y" * 4_000)
+    session.add_message("user", "recent question")
+    session.add_message("assistant", "recent answer")
+    session.updated_at = datetime.now() - timedelta(minutes=10)
+    loop.sessions.save(session)
+
+    scheduled = []
+    logs: list[str] = []
+    sink = logger.add(logs.append, level="INFO", format="{message}")
+    try:
+        if trigger == "manual":
+            await loop._process_message(
+                InboundMessage(channel="cli", sender_id="user", chat_id="estimates", content="/compact"),
+                runtime=loop.llm_runtime(),
+            )
+        else:
+            await loop.auto_compact.check_expired(scheduled.append, loop.compaction_runtime_for_session)
+            assert len(scheduled) == 1
+            await scheduled.pop()
+        reason = "idle" if trigger == "scheduled_idle" else "manual"
+        [line] = [line for line in logs if line.startswith(f"Session compact for {key} ({reason}):")]
+        match = re.search(
+            r"archived=\d+, replay_tail=\d+, retained=\d+, summary=True, stages=1, "
+            r"est\. replay prompt tokens (\d+) -> (\d+), saved (\d+) tokens \((\d+)%\)$",
+            line,
+        )
+        assert match
+        before, after, saved, pct = map(int, match.groups())
+        assert before - after == saved > 0
+        assert abs(pct - saved * 100 / before) < 1
+        loop.sessions.invalidate(key)
+        reloaded = loop.sessions.get_or_create(key)
+        assert reloaded.metadata["_last_summary"]["text"] == "Checkpoint."
+    finally:
+        for coro in scheduled:
+            coro.close()
+        logger.remove(sink)
+        await loop.aclose()
+
+
+@pytest.mark.parametrize("phase", ["before", "after"])
+async def test_compaction_success_log_survives_probe_failure(tmp_path, monkeypatch, phase) -> None:
+    # A failed replay sizing probe (before publication or after the committed
+    # checkpoint) drops the metric but must not flip the reported outcome.
+    def cost(message):
+        return 4 + sum(len(str(message.get(field, "")).encode()) for field in (
+            "content", "tool_calls", "tool_call_id", "name",
+        ))
+
+    for module in ("context_governance", "memory"):
+        monkeypatch.setattr(f"nanobot.agent.{module}.estimate_message_tokens", cost)
+    foreground, loop = _make_loop(tmp_path, context_window_tokens=120_000, fg_max_tokens=100)
+    foreground.estimate_prompt_tokens.side_effect = lambda messages, tools, model: (
+        sum(map(cost, messages)), "synthetic-byte-counter",
+    )
+
+    def probe(self, session, provider, model):
+        # The live pre-compaction session has no committed summary; the
+        # post-compaction projection carries one, so it marks the phase.
+        if (session.metadata.get("_last_summary") is not None) == (phase == "after"):
+            raise RuntimeError("probe failed")
+        return sum(map(cost, session.get_text_history())), "synthetic-byte-counter"
+
+    monkeypatch.setattr("nanobot.agent.memory.Consolidator._session_prompt_probe", probe)
+    key = "cli:probe-failure"
+    session = loop.sessions.get_or_create(key)
+    session.add_message("user", "old question " + "x" * 4_000)
+    session.add_message("assistant", "old answer " + "y" * 4_000)
+    session.add_message("user", "recent question")
+    session.add_message("assistant", "recent answer")
+    loop.sessions.save(session)
+
+    logs: list[str] = []
+    sink = logger.add(logs.append, level="INFO", format="{message}")
+    try:
+        await loop._process_message(
+            InboundMessage(channel="cli", sender_id="user", chat_id="probe-failure", content="/compact"),
+            runtime=loop.llm_runtime(),
+        )
+        [line] = [entry for entry in logs if entry.startswith(f"Session compact for {key} (manual):")]
+        assert line.rstrip().endswith("summary=True, stages=1")
+        assert "est. replay prompt tokens" not in line
+    finally:
+        logger.remove(sink)
+        await loop.aclose()
+
+    loop.sessions.invalidate(key)
+    reloaded = loop.sessions.get_or_create(key)
+    assert reloaded.metadata["_last_summary"]["text"] == "Checkpoint."
+
+
 @pytest.mark.parametrize(("floor", "reserve", "compactor_prompt_tokens"), [
     (600, 0, 100),  # Existing replayable history is exactly at the floor.
     (601, 0, 100),  # The skipped placeholder must not count as history.
@@ -750,7 +939,14 @@ async def test_sdk_compaction_cannot_keep_floor(tmp_path, monkeypatch, floor, re
         await loop.aclose()
 
 
-async def test_session_compaction_does_not_retry_a_projected_budget_mismatch(tmp_path, monkeypatch):
+async def test_session_compaction_retries_bounded_on_projected_budget_mismatch(tmp_path, monkeypatch):
+    """A projected replay overrun never makes session sizing scan unbounded.
+
+    The projected estimate is a constant above the foreground input budget,
+    so every legal cut is rejected; the bounded retry probes only a small
+    number of the oldest candidates instead of all of them, and no
+    summarizer call is issued.
+    """
     monkeypatch.setattr("nanobot.agent.context_governance.estimate_message_tokens", lambda _: 100)
     foreground, loop = _make_loop(
         tmp_path, context_window_tokens=12_000, fg_max_tokens=100, min_verbatim_tail_tokens=400,
@@ -771,10 +967,28 @@ async def test_session_compaction_does_not_retry_a_projected_budget_mismatch(tmp
             return (100, "test-counter")
 
         foreground.estimate_prompt_tokens.side_effect = estimate
-        assert await RuntimeClient(loop).compact_idle_session(key) == ""
+        logs: list[str] = []
+        sink = logger.add(logs.append, level="INFO", format="{message}")
+        try:
+            assert await RuntimeClient(loop).compact_idle_session(key) == ""
+        finally:
+            logger.remove(sink)
 
-        [projected_size] = projected_sizes
-        assert projected_size > 10  # Many smaller legal tail candidates existed.
+        # Many legal tail candidates existed, but only the bounded oldest set
+        # was projected.
+        assert len(projected_sizes) == 3
+        assert projected_sizes[0] > 10
+        # The skip line consumes the replay_over_budget diagnostics instead of
+        # a second planner log.
+        assert any(
+            re.search(
+                r"Skipping session compaction for " + re.escape(key) + r" \(sdk\): "
+                r"no projected replay fit within the foreground input budget "
+                r"\(last: \d+ > \d+ tokens including summary and reserve; 3 request\(s\) probed\)",
+                line,
+            )
+            for line in logs
+        )
         foreground.chat_stream_with_retry.assert_not_awaited()
         loop.compactor_runtime().provider.chat_stream_with_retry.assert_not_awaited()
         assert (await loop.sessions.state.get(key)).last_archived == 0
@@ -1129,15 +1343,71 @@ async def oversized_import(tmp_path, monkeypatch):
         await loop.aclose()
 
 
-@pytest.mark.parametrize("sizing_mismatch", [False, True], ids=["additive-fit", "earlier-exact-fit"])
+@pytest.mark.parametrize(
+    "sizing_mismatch", [None, "stage", "replay"],
+    ids=["additive-fit", "earlier-exact-stage-fit", "later-exact-replay-fit"],
+)
 async def test_oversized_import_dry_run_and_manual_apply_use_the_same_stages(oversized_import, sizing_mismatch):
     loop, compactor, foreground, key, original, cost = oversized_import
     full_history = original.get_history()
     input_budget = 200_000 - 4_096
     probed_batch_counts = []
+    replay_batch_counts = []
+    replay_overhead = 0
+    tail_floor = 90_000
+    first_retained_batch = 13
+
+    if sizing_mismatch == "replay":
+        # Rejected replay: the gateway's prompt estimate carries fixed
+        # overhead the additive sizing does not. Size the overhead so the
+        # four-bundle additive cut is rejected and the next legal cut (three
+        # bundles, above the floor) fits with equality.
+        runtime, _tools, _no_tools, replay_config = await loop.compaction_runtime_for_session(
+            original, replay_runtime=loop.llm_runtime(),
+        )
+        compactor_budget = loop.consolidator.compactor_input_budget(
+            runtime, None, len(full_history),
+        )
+        assert compactor_budget is not None
+        foreground_input_budget = 120_000 - 100 - 1024  # window - max output - safety buffer
+        wrapper_cost = sum(map(cost, loop.consolidator._session_replay_wrapper(original, "")))
+        continuation_cost = cost({"role": "user", "content": SUMMARY_CONTINUATION_TEXT})
+        replay_tail_budget = (
+            foreground_input_budget
+            - wrapper_cost - continuation_cost
+            - compactor_budget.max_summary_tokens
+            - replay_config.next_turn_input_reserve_tokens
+        )
+        tail_costs = [cost(m) for m in full_history]
+        batch_starts = {
+            int(str(message["tool_calls"][0]["id"]).split("-")[1]): i
+            for i, message in enumerate(full_history)
+            if message.get("role") == "assistant" and message.get("tool_calls")
+        }
+        three_bundle_tail = sum(tail_costs[batch_starts[14]:])  # Batches 14..16 plus reply.
+        four_bundle_tail = sum(tail_costs[batch_starts[13]:])  # Batches 13..16 plus reply.
+        # The four-bundle cut is the oldest additive fit; the overhead must
+        # reject exactly its replay so the next legal cut decides the sizing.
+        assert three_bundle_tail < four_bundle_tail <= replay_tail_budget
+        tail_floor = three_bundle_tail // 2
+        loop.compactor_min_verbatim_tail_tokens = tail_floor
+        replay_overhead = replay_tail_budget - three_bundle_tail
+        first_retained_batch = 14
+
+    def estimate_replay(messages, tools, model):
+        tokens = sum(map(cost, messages))
+        batches = sum(bool(message.get("tool_calls")) for message in messages)
+        if batches in (3, 4) and messages[-1].get("content") == SUMMARY_CONTINUATION_TEXT:
+            replay_batch_counts.append(batches)
+            tokens += replay_overhead
+        return tokens, "synthetic-replay-counter"
+
+    if sizing_mismatch == "replay":
+        foreground.estimate_prompt_tokens.side_effect = estimate_replay
+        assert replay_overhead > 0
 
     def estimate(messages, tools, model):
-        if sizing_mismatch and messages and messages[0].get("content") == full_history[0]["content"]:
+        if sizing_mismatch == "stage" and messages and messages[0].get("content") == full_history[0]["content"]:
             batches = sum(bool(message.get("tool_calls")) for message in messages)
             probed_batch_counts.append(batches)
             # The additive fit is eight bundles; exact sizing fits seven, with
@@ -1169,9 +1439,11 @@ async def test_oversized_import_dry_run_and_manual_apply_use_the_same_stages(ove
     assert "summary generated by the compactor (discarded)" in reply.content
     requests = [call.kwargs for call in compactor.chat_stream_with_retry.call_args_list]
     assert len(requests) == 2
-    if sizing_mismatch:
+    if sizing_mismatch == "stage":
         assert probed_batch_counts[:3] == [13, 8, 7]
         assert sum(bool(m.get("tool_calls")) for m in requests[0]["messages"]) == 7
+    if sizing_mismatch == "replay":
+        assert replay_batch_counts[:2] == [4, 3]
     assert "- Stage 1:" in reply.content and "- Stage 2:" in reply.content
     assert "25.0 output tokens/s (measured streaming)" in reply.content
     assert "10 output tokens" in reply.content
@@ -1183,9 +1455,24 @@ async def test_oversized_import_dry_run_and_manual_apply_use_the_same_stages(ove
     assert loop.consolidator.store.read_unprocessed_history(0) == []
 
     compactor.chat_stream_with_retry.reset_mock()
-    await command("/compact")
+    logs: list[str] = []
+    sink = logger.add(logs.append, level="INFO", format="{message}")
+    try:
+        await command("/compact")
+    finally:
+        logger.remove(sink)
     assert [call.kwargs for call in compactor.chat_stream_with_retry.call_args_list] == requests
     foreground.chat_stream_with_retry.assert_not_awaited()
+    # The staged success log keeps the per-stage counts and adds the same
+    # comparable before/after replay estimates as the single-request path.
+    [line] = [entry for entry in logs if entry.startswith(f"Session compact for {key} (manual):")]
+    metrics = re.search(
+        r"stages=2, est\. replay prompt tokens (\d+) -> (\d+), saved (\d+) tokens \((\d+)%\)$", line,
+    )
+    assert metrics
+    before, after, saved, pct = map(int, metrics.groups())
+    assert before - after == saved > 0
+    assert abs(pct - saved * 100 / before) < 1
     prefix = []
     carry = None
     for i, request in enumerate(requests):
@@ -1205,21 +1492,22 @@ async def test_oversized_import_dry_run_and_manual_apply_use_the_same_stages(ove
     assert prefix == full_history[:applied.last_archived]
     assert applied.get_history() == full_history[applied.last_archived:]
     assert applied.get_history()[0]["role"] == "assistant"
-    assert sum(map(cost, applied.get_history())) >= 90_000
+    assert sum(map(cost, applied.get_history())) >= tail_floor
     assert applied.provider_state is None
-    assert applied.metadata["_last_summary"]["text"] == "Checkpoint through call-12."
+    final_summary = f"Checkpoint through call-{first_retained_batch - 1}."
+    assert applied.metadata["_last_summary"]["text"] == final_summary
     assert sum(is_summary_checkpoint(m) for m in applied.messages) == 1
     [entry] = loop.consolidator.store.read_unprocessed_history(0)
-    assert entry["content"] == "Checkpoint through call-12."
+    assert entry["content"] == final_summary
 
     # A new foreground turn resumes from the persisted summary and retained
     # assistant-leading tail, not from an intermediate stage or old raw prefix.
     await command("What is the latest status?")
     foreground.chat_stream_with_retry.assert_awaited_once()
     replay = foreground.chat_stream_with_retry.call_args.kwargs["messages"]
-    assert "Checkpoint through call-12." in replay[0]["content"]
+    assert final_summary in replay[0]["content"]
     assert {m["tool_call_id"] for m in replay if m["role"] == "tool"} == {
-        "call-13", "call-14", "call-15", "call-16",
+        f"call-{i}" for i in range(first_retained_batch, 17)
     }
 
 

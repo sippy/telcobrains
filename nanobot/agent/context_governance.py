@@ -9,6 +9,7 @@ session history list in place.
 from __future__ import annotations
 
 import asyncio
+from collections import deque
 from collections.abc import Awaitable, Callable
 from contextvars import copy_context
 from copy import deepcopy
@@ -76,8 +77,44 @@ BACKFILL_CONTENT = "[Tool result unavailable — call was interrupted or lost]"
 PLACEHOLDER_TEXTS = frozenset({
     "[Previous assistant message omitted.]",
 })
+# Each projected replay estimate scans the retained tail. Keep the retry
+# bound independent of transcript size so total sizing work stays linear.
+_SESSION_REPLAY_PROBE_LIMIT = 3
 _PreparationArgs = ParamSpec("_PreparationArgs")
 _PreparationResult = TypeVar("_PreparationResult")
+
+
+@dataclass(frozen=True)
+class PrefixCutResult:
+    """Outcome of :meth:`ContextGovernor.select_prefix_cut`.
+
+    ``reason`` is a stable code explaining why no cut was selected; it is
+    ``None`` when a cut was chosen:
+
+    - ``no_history``: too little raw transcript before the unsent delta to
+      summarize.
+    - ``no_capacity``: the foreground or compactor budget cannot be derived
+      or is non-positive, so no tail or prefix can fit.
+    - ``below_floor``: the whole replayable history is at or below the
+      configured session verbatim-tail floor; there is nothing to archive.
+      ``history_tokens`` carries the additive estimate.
+    - ``no_legal_cut``: no tool-pair-safe boundary satisfies the floor and
+      tail headroom.
+    - ``compactor_over_budget``: every qualifying cut would compact a prefix
+      too large for the compactor's input budget.
+    - ``replay_over_budget``: every probed projected replay request exceeds
+      the foreground input budget. The probe counters below carry the
+      estimate/budget diagnostics for the skip log.
+    """
+
+    cut: int | None
+    reason: str | None = None
+    history_tokens: int | None = None
+    #: Set only for ``replay_over_budget``: how many projected requests were
+    #: probed, and the last probe's requirement versus the input budget.
+    rejected_probes: int | None = None
+    last_required_tokens: int | None = None
+    input_budget_tokens: int | None = None
 
 
 class ContextWindowExceededError(RuntimeError):
@@ -700,7 +737,7 @@ class ContextGovernor:
             compaction.active_summary,
             delta_messages,
             tool_definitions,
-        )
+        ).cut
 
     def select_prefix_cut(
         self,
@@ -716,15 +753,18 @@ class ContextGovernor:
         session_compaction: bool = False,
         next_turn_input_reserve_tokens: int = 0,
         check_prefix_capacity: bool = True,
-    ) -> int | None:
+    ) -> PrefixCutResult:
         """Choose the oldest raw prefix to compact, protecting a verbatim tail.
 
-        Returns the raw transcript index ``i`` where compaction stops: the
+        Returns a :class:`PrefixCutResult` whose ``cut`` is the raw transcript
+        index ``i`` where compaction stops: the
         prefix ``raw[:i]`` is summarized while the tail between ``i`` and the
-        unsent delta is kept verbatim. The oldest legal boundary satisfying
-        the additive replay budget and any session floor gets one projected
-        request probe (summary transcript, protected tail, continuation,
-        unsent delta, tools, and the summary's reserved output). The compacted
+        unsent delta is kept verbatim. Probe the oldest legal boundary satisfying
+        the additive replay budget and any session floor using the projected
+        request (summary transcript, protected tail, continuation, unsent delta,
+        tools, and the summary's reserved output). On a projected replay budget
+        mismatch, session compaction can try a bounded number of later qualifying
+        boundaries. In-turn compaction makes only one probe. The compacted
         prefix must additionally fit the compactor's actual input budget
         (window minus reserved output, summarization prompt, and the prior
         summary). Any newer cut compacts a larger prefix, so when the most
@@ -732,6 +772,11 @@ class ContextGovernor:
         either budget check fails, the caller chooses its usual fallback.
         Session callers may disable the additive prefix check and instead size
         the exact prefix request or partition it into separately sized stages.
+
+        When no cut is selected, ``reason`` carries a stable code (see
+        :class:`PrefixCutResult`) so session compaction can tell a history
+        that is already at or below the configured verbatim-tail floor
+        apart from a genuine no-legal-cut or budget rejection.
 
         ``raw`` is the transcript being compacted, supplied without the
         post-compaction replay wrapper. The *wrapper* is only the replay
@@ -753,11 +798,21 @@ class ContextGovernor:
         protected tail (or yields no cut) but never reduces compactor
         capacity, and in-turn compaction with a real delta does not pass it.
         """
-        if budget is None or not config.context_window_tokens or delta_start < (2 if session_compaction else 3):
-            return None
+        if budget is None or not config.context_window_tokens:
+            return PrefixCutResult(cut=None, reason="no_capacity")
+        floor = config.min_verbatim_tail_tokens if session_compaction else 0
+        if delta_start < (2 if session_compaction else 3):
+            # A thin history can never be cut; when it already sits at or
+            # below the session floor, the additive sizing alone says so.
+            # Policy is unchanged: both outcomes leave the history intact.
+            if session_compaction and floor > 0:
+                total_cost = sum(estimate_message_tokens(message) for message in raw[:delta_start])
+                if total_cost <= floor:
+                    return PrefixCutResult(cut=None, reason="below_floor", history_tokens=total_cost)
+            return PrefixCutResult(cut=None, reason="no_history")
         input_budget = self.input_budget(config)
         if input_budget <= 0:
-            return None
+            return PrefixCutResult(cut=None, reason="no_capacity")
         reserve = max(0, next_turn_input_reserve_tokens)
 
         # Foreground headroom for the protected tail: everything the
@@ -789,7 +844,7 @@ class ContextGovernor:
             - reserve
         )
         if tail_budget <= 0:
-            return None
+            return PrefixCutResult(cut=None, reason="no_capacity")
 
         prior_summary_cost = 0
         if prior_summary:
@@ -803,21 +858,27 @@ class ContextGovernor:
             budget.input_budget - budget.fixed_overhead_tokens - prior_summary_cost
         )
         if check_prefix_capacity and prefix_capacity <= 0:
-            return None
+            return PrefixCutResult(cut=None, reason="no_capacity")
 
-        floor = config.min_verbatim_tail_tokens if session_compaction else 0
         # A positive session floor counts only replayable history and must
         # still leave a nonempty history prefix to summarize.
         first_cut = 1 if session_compaction else 2
-        if floor > tail_budget or first_cut >= delta_start:
-            return None
+        if first_cut >= delta_start:
+            return PrefixCutResult(cut=None, reason="no_legal_cut")
         legal = self.legal_cut_indices(raw, delta_start)
         costs = [estimate_message_tokens(message) for message in raw[:delta_start]]
-        if floor > 0 and sum(costs) <= floor:
-            return None
         total_cost = sum(costs)
-        cut: int | None = None
-        cut_tail_cost = 0
+        if floor > 0 and total_cost <= floor:
+            # The per-message sizing already proved the whole replayable
+            # history fits the floor; do not re-tokenize it. Report the no-op
+            # even when the floor itself exceeds the tail headroom, because
+            # the distinguishing fact is that there is nothing to archive.
+            return PrefixCutResult(cut=None, reason="below_floor", history_tokens=total_cost)
+        if floor > tail_budget:
+            return PrefixCutResult(cut=None, reason="no_legal_cut")
+        candidates: deque[tuple[int, int]] = deque(
+            maxlen=_SESSION_REPLAY_PROBE_LIMIT if session_compaction else 1,
+        )
         tail_cost = 0
         for index in range(delta_start - 1, first_cut - 1, -1):
             tail_cost += costs[index]
@@ -828,26 +889,42 @@ class ContextGovernor:
                 or raw[index].get("role") == "user"
                 or (floor > 0 and raw[index].get("role") == "assistant")
             ):
-                cut = index
-                cut_tail_cost = tail_cost
-        if cut is None or (check_prefix_capacity and total_cost - cut_tail_cost > prefix_capacity):
-            return None
-        if find_legal_message_start(raw[cut:delta_start]) != 0:
-            return None
-        # Probe only the oldest qualifying cut. Projecting each suffix in
-        # turn on an estimator mismatch would make sizing quadratic.
-        probe = self.prepare_messages_for_model(config, [
-            *wrapper,
-            *raw[cut:delta_start],
-            *continuation,
-            *delta_messages,
-        ])
-        probe_cost, _ = estimate_prompt_tokens_chain(
-            config.provider, config.model, probe, tool_definitions,
-        )
-        if probe_cost + budget.max_summary_tokens + reserve > input_budget:
-            return None
-        return cut
+                # Walking backward leaves the oldest qualifying cuts at the front.
+                candidates.appendleft((index, tail_cost))
+        if not candidates:
+            return PrefixCutResult(cut=None, reason="no_legal_cut")
+        rejected_probes = 0
+        last_required = 0
+        for cut, cut_tail_cost in candidates:
+            if check_prefix_capacity and total_cost - cut_tail_cost > prefix_capacity:
+                # A later cut would compact an even larger prefix.
+                return PrefixCutResult(cut=None, reason="compactor_over_budget")
+            tail = raw[cut:delta_start]
+            if find_legal_message_start(tail) != 0:
+                return PrefixCutResult(cut=None, reason="no_legal_cut")
+            probe = self.prepare_messages_for_model(config, [
+                *wrapper,
+                *tail,
+                *continuation,
+                *delta_messages,
+            ])
+            probe_cost, _ = estimate_prompt_tokens_chain(
+                config.provider, config.model, probe, tool_definitions,
+            )
+            last_required = probe_cost + budget.max_summary_tokens + reserve
+            if last_required <= input_budget:
+                return PrefixCutResult(cut=cut)
+            rejected_probes += 1
+        if rejected_probes:
+            # The caller renders the estimate/budget diagnostics; the planner
+            # stays silent so a session skip is not logged twice.
+            return PrefixCutResult(
+                cut=None, reason="replay_over_budget",
+                rejected_probes=rejected_probes,
+                last_required_tokens=last_required,
+                input_budget_tokens=input_budget,
+            )
+        return PrefixCutResult(cut=None, reason="no_legal_cut")
 
     async def _compact_request_history(
         self,

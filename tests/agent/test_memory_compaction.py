@@ -390,7 +390,7 @@ def _session_cut(monkeypatch, *, reserve: int, budget: CompactorInputBudget) -> 
         config, raw, len(raw), budget, wrapper, None, [], None,
         session_compaction=True,
         next_turn_input_reserve_tokens=reserve,
-    )
+    ).cut
 
 
 def test_session_cut_charges_reserve_against_replay_headroom(monkeypatch):
@@ -447,7 +447,7 @@ def _session_cut_with_floor(
         config, raw, len(raw), budget, wrapper, None, [], None,
         session_compaction=True,
         next_turn_input_reserve_tokens=reserve,
-    )
+    ).cut
 
 
 _TOOL_TURN_HISTORY = [
@@ -522,6 +522,186 @@ def test_session_cut_floor_disabled_keeps_legacy_user_boundary_sizing(monkeypatc
     # assistant boundary stays out of play without a floor.
     assert cut == 6
     assert raw[cut]["role"] == "user"
+
+
+def test_session_cut_reports_below_floor_no_op_distinctly_from_no_legal_cut(monkeypatch):
+    """A history at or below the floor is a no-op, not a sizing rejection.
+
+    Both outcomes keep the full history, but the skip log must tell "nothing
+    to archive by design" (with its estimate) apart from a tail that
+    genuinely cannot meet the floor.
+    """
+    _cost_model(monkeypatch, heavy="HEAVY", heavy_cost=2000, light_cost=10)
+    config = ContextGovernanceConfig(
+        provider=MagicMock(spec=LLMProvider),
+        model="test-model",
+        tools=MagicMock(get_definitions=MagicMock(return_value=[])),
+        workspace=None,
+        session_key="cut-test",
+        max_tool_result_chars=_MAX_TOOL_RESULT_CHARS,
+        context_window_tokens=10_000,
+        max_tokens=100,
+        min_verbatim_tail_tokens=6050,
+    )
+    budget = CompactorInputBudget(input_budget=5_000, fixed_overhead_tokens=100, max_summary_tokens=200)
+    wrapper = [{"role": "system", "content": "wrapper"}]
+    raw = list(_TOOL_TURN_HISTORY)
+
+    # 3x2000 + 5x10 = 6050 replayable tokens; at exactly that floor the whole
+    # history is protected, so there is nothing to archive. The decision comes
+    # from the additive per-message sizing, without a projected probe.
+    result = ContextGovernor().select_prefix_cut(
+        config, raw, len(raw), budget, wrapper, None, [], None,
+        session_compaction=True,
+    )
+    assert (result.cut, result.reason, result.history_tokens) == (None, "below_floor", 6050)
+
+    # One token lower admits no legal tail (the largest is 4050 tokens), so
+    # this is a genuine no-legal-cut, not a floor no-op.
+    config.min_verbatim_tail_tokens = 6049
+    result = ContextGovernor().select_prefix_cut(
+        config, raw, len(raw), budget, wrapper, None, [], None,
+        session_compaction=True,
+    )
+    assert (result.cut, result.reason, result.history_tokens) == (None, "no_legal_cut", None)
+
+    # A thin (single-message) history can never be cut; at the floor it is the
+    # same no-op, and above it stays a no-history rejection.
+    result = ContextGovernor().select_prefix_cut(
+        config, [dict(raw[0])], 1, budget, wrapper, None, [], None,
+        session_compaction=True,
+    )
+    assert (result.cut, result.reason, result.history_tokens) == (None, "below_floor", 2000)
+    config.min_verbatim_tail_tokens = 1500
+    result = ContextGovernor().select_prefix_cut(
+        config, [dict(raw[0])], 1, budget, wrapper, None, [], None,
+        session_compaction=True,
+    )
+    assert (result.cut, result.reason, result.history_tokens) == (None, "no_history", None)
+
+
+def _replay_probe_cost_model(monkeypatch, heavy: set[str]) -> list[int]:
+    """Flat additive costs with inflated projected chain costs on ``heavy``.
+
+    The additive tail sizing ignores the mismatch; only the projected replay
+    probes see it. Returns the projected probe call sizes, in probe order.
+    """
+    probes: list[int] = []
+
+    def estimate(_provider, _model, messages, _tools):
+        contents = [str(message.get("content") or "") for message in messages]
+        if "a3" in contents:
+            probes.append(len(messages))
+        return sum(3000 if content in heavy else 10 for content in contents), "test-counter"
+
+    monkeypatch.setattr(
+        "nanobot.agent.context_governance.estimate_prompt_tokens_chain", estimate,
+    )
+    monkeypatch.setattr(
+        "nanobot.agent.context_governance.estimate_message_tokens",
+        lambda message: 10,
+    )
+    return probes
+
+
+def _replay_probe_config(window: int = 4000) -> ContextGovernanceConfig:
+    return ContextGovernanceConfig(
+        provider=MagicMock(spec=LLMProvider),
+        model="test-model",
+        tools=MagicMock(get_definitions=MagicMock(return_value=[])),
+        workspace=None,
+        session_key="replay-probe-test",
+        max_tool_result_chars=_MAX_TOOL_RESULT_CHARS,
+        context_window_tokens=window,
+        max_tokens=100,
+    )
+
+
+_REPLAY_PROBE_HISTORY = [
+    {"role": "user", "content": "q0"},
+    {"role": "assistant", "content": "a0"},
+    {"role": "user", "content": "q1"},
+    {"role": "assistant", "content": "a1"},
+    {"role": "user", "content": "q2"},
+    {"role": "assistant", "content": "a2"},
+    {"role": "user", "content": "q3"},
+    {"role": "assistant", "content": "a3"},
+]
+
+
+def test_session_replay_probe_retries_next_legal_cut_on_estimator_mismatch(monkeypatch):
+    """An offline fit can be rejected by the gateway's projected replay estimate.
+
+    The oldest additive cut carries an old message whose chain estimate
+    overruns the foreground input budget; the next legal user boundary
+    drops it and fits, so session compaction must retry it.
+    """
+    probes = _replay_probe_cost_model(monkeypatch, {"a1"})
+    config = _replay_probe_config()
+    budget = CompactorInputBudget(
+        input_budget=1000, fixed_overhead_tokens=100, max_summary_tokens=200,
+    )
+
+    cut = ContextGovernor().select_prefix_cut(
+        config, list(_REPLAY_PROBE_HISTORY), len(_REPLAY_PROBE_HISTORY), budget,
+        [{"role": "system", "content": "wrapper"}], None, [], None,
+        session_compaction=True,
+    ).cut
+
+    assert cut == 4
+    assert probes == [8, 6]  # The rejected oldest cut, then the next legal one.
+
+
+def test_session_replay_probe_retry_is_bounded_and_reports_rejection(monkeypatch):
+    """When every probed cut is rejected, the retry stays bounded and reports.
+
+    Four legal cuts exist, but only the three oldest are probed; the newer
+    cut that would fit is never reached, so sizing work stays independent of
+    transcript length.
+    """
+    probes = _replay_probe_cost_model(monkeypatch, {"a1", "a3"})
+    config = _replay_probe_config()
+    budget = CompactorInputBudget(
+        input_budget=1000, fixed_overhead_tokens=100, max_summary_tokens=200,
+    )
+    history = list(_REPLAY_PROBE_HISTORY) + [
+        {"role": "user", "content": "q4"},
+        {"role": "assistant", "content": "a4"},
+    ]
+    result = ContextGovernor().select_prefix_cut(
+        config, history, len(history), budget,
+        [{"role": "system", "content": "wrapper"}], None, [], None,
+        session_compaction=True,
+    )
+
+    assert result.cut is None
+    assert result.reason == "replay_over_budget"
+    assert probes == [10, 8, 6]  # Bounded to three projected probes, not four.
+    # The estimate/budget diagnostics ride on the result so the session skip
+    # log can report them without a second planner log line.
+    assert result.rejected_probes == 3
+    assert result.last_required_tokens == 3250  # 3050-token probe + 200 summary.
+    assert result.input_budget_tokens == 2876  # 4000 - 100 max output - 1024 buffer.
+
+
+def test_foreground_replay_probe_keeps_single_probe(monkeypatch):
+    """In-turn compaction keeps the historical single-probe behavior."""
+    probes = _replay_probe_cost_model(monkeypatch, {"a1"})
+    config = _replay_probe_config()
+    budget = CompactorInputBudget(
+        input_budget=1000, fixed_overhead_tokens=100, max_summary_tokens=200,
+    )
+
+    cut = ContextGovernor().select_prefix_cut(
+        config, list(_REPLAY_PROBE_HISTORY), len(_REPLAY_PROBE_HISTORY), budget,
+        [{"role": "system", "content": "wrapper"}], None,
+        [{"role": "user", "content": "new input"}], None,
+    ).cut
+
+    # The rejected oldest cut is never retried in-turn; the next legal cut
+    # would fit, but foreground sizing keeps one probe.
+    assert cut is None
+    assert probes == [8]
 
 
 def test_foreground_cut_ignores_next_turn_reserve(monkeypatch):

@@ -319,7 +319,7 @@ async def cmd_compact(ctx: CommandContext) -> OutboundMessage | None:
         not message.get("_command") and not is_summary_checkpoint(message)
         for message in session.messages[session.last_archived:]
     ):
-        content = "Context unchanged: no compaction fit while keeping the configured minimum of recent history."
+        content = "Context unchanged: nothing to compact while keeping the configured minimum of recent history."
     return OutboundMessage(
         channel=ctx.msg.channel, chat_id=ctx.msg.chat_id, content=content,
         metadata=dict(ctx.msg.metadata or {}),

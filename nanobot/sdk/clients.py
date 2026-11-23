@@ -157,6 +157,7 @@ class RuntimeClient:
                 tools=tools,
                 no_tool_contract=no_tool_contract,
                 replay_config=replay_config,
+                reason="sdk",
             )
             return snapshot_from_session(
                 await self._loop.sessions.state.get(session_key)
@@ -174,4 +175,5 @@ class RuntimeClient:
                 no_tool_contract=no_tool_contract,
                 replay_config=replay_config,
                 max_suffix=max_suffix,
+                reason="sdk",
             )
