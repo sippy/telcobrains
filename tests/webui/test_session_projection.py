@@ -159,3 +159,56 @@ async def test_hydration_yields_during_metadata_read_and_reads_live_turn_on_loop
         events = await task
     assert events[0]["goal_state"] == {"active": False}
     assert events[1]["status"] == "running"
+async def test_attach_fields_carry_usage_limit_reset_details() -> None:
+    """Reconnect/reload rebuilds the recovery notice from durable state."""
+    sessions = MagicMock()
+    sessions.state.read_metadata = AsyncMock(side_effect=lambda key: sessions.read_session_metadata(key))
+    sessions.read_session_metadata.return_value = {
+        "metadata": {
+            RECOVERY_METADATA_KEY: {
+                "status": "awaiting_user",
+                "recovery_id": "recovery-limit",
+                "reason": "model_request_failed",
+                "failure_error_kind": "usage_limit",
+                "failure_reset_time": "1pm",
+                "failure_reset_timezone": "America/Vancouver",
+            },
+        }
+    }
+
+    projection = WebUISessionProjection(sessions)
+
+    fields = await projection.attach_fields("websocket:chat-1")
+    assert fields["recovery_state"] == {
+        "status": "awaiting_user",
+        "recovery_id": "recovery-limit",
+        "reason": "model_request_failed",
+        "failure_error_kind": "usage_limit",
+        "failure_reset_time": "1pm",
+        "failure_reset_timezone": "America/Vancouver",
+    }
+
+
+async def test_attach_fields_drop_unvalidated_reset_details() -> None:
+    sessions = MagicMock()
+    sessions.state.read_metadata = AsyncMock(side_effect=lambda key: sessions.read_session_metadata(key))
+    for failure_error_kind, reset_time, reset_timezone in (
+        ("usage_limit", "13pm", "America/Vancouver"),
+        ("usage_limit", "1pm", "Not/AZone"),
+        ("connection", "1pm", "America/Vancouver"),
+    ):
+        sessions.read_session_metadata.return_value = {
+            "metadata": {
+                RECOVERY_METADATA_KEY: {
+                    "status": "awaiting_user",
+                    "recovery_id": "recovery-limit",
+                    "reason": "model_request_failed",
+                    "failure_error_kind": failure_error_kind,
+                    "failure_reset_time": reset_time,
+                    "failure_reset_timezone": reset_timezone,
+                },
+            }
+        }
+        fields = await WebUISessionProjection(sessions).attach_fields("websocket:chat-1")
+        assert "failure_reset_time" not in fields["recovery_state"]
+        assert "failure_reset_timezone" not in fields["recovery_state"]

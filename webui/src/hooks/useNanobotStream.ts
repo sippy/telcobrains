@@ -830,6 +830,12 @@ export function useNanobotStream(
           ...(typeof ev.failure_error_kind === "string"
             ? { failure_error_kind: ev.failure_error_kind }
             : {}),
+          ...(typeof ev.failure_reset_time === "string"
+            ? { failure_reset_time: ev.failure_reset_time }
+            : {}),
+          ...(typeof ev.failure_reset_timezone === "string"
+            ? { failure_reset_timezone: ev.failure_reset_timezone }
+            : {}),
           ...(typeof ev.reply_preserved === "boolean"
             ? { reply_preserved: ev.reply_preserved }
             : {}),

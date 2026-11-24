@@ -10,6 +10,7 @@ from uuid import uuid4
 from loguru import logger
 
 from nanobot.bus.events import InboundMessage
+from nanobot.providers.base import valid_reset_clock, valid_reset_timezone
 from nanobot.session.manager import Session
 from nanobot.session.message_metadata import persisted_message
 from nanobot.session.session_messages import session_message_envelope, session_message_input
@@ -516,4 +517,18 @@ def recovery_state_from_metadata(metadata: Mapping[str, Any] | None) -> dict[str
         payload["failure_error_kind"] = failure_error_kind
     if state.get("reply_preserved") is True:
         payload["reply_preserved"] = True
+    # Limit-reset details are transient display facts, exposed only for the
+    # usage-limit kind and only when both values still validate; anything
+    # else (including raw or stale provider text) is dropped at this boundary.
+    failure_reset_time = state.get("failure_reset_time")
+    failure_reset_timezone = state.get("failure_reset_timezone")
+    if (
+        failure_error_kind == "usage_limit"
+        and isinstance(failure_reset_time, str)
+        and isinstance(failure_reset_timezone, str)
+        and valid_reset_clock(failure_reset_time)
+        and valid_reset_timezone(failure_reset_timezone)
+    ):
+        payload["failure_reset_time"] = failure_reset_time
+        payload["failure_reset_timezone"] = failure_reset_timezone
     return payload

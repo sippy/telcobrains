@@ -72,6 +72,8 @@ class RecoveryStateWirePayload(_ChatWirePayload):
     can_continue: NotRequired[bool]
     failure_error_kind: NotRequired[str]
     reply_preserved: NotRequired[bool]
+    failure_reset_time: NotRequired[str]
+    failure_reset_timezone: NotRequired[str]
 
 
 class RetryStatusWirePayload(_ChatWirePayload):
@@ -232,6 +234,15 @@ def encode_recovery_state(
         payload["failure_error_kind"] = event.failure_error_kind
     if event.reply_preserved is not None:
         payload["reply_preserved"] = event.reply_preserved
+    # Reset details are a usage-limit-only display fact; never surface them
+    # for other failure kinds.
+    if (
+        event.failure_error_kind == "usage_limit"
+        and event.failure_reset_time is not None
+        and event.failure_reset_timezone is not None
+    ):
+        payload["failure_reset_time"] = event.failure_reset_time
+        payload["failure_reset_timezone"] = event.failure_reset_timezone
     return payload
 
 

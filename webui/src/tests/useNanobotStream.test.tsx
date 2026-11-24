@@ -900,6 +900,107 @@ describe("useNanobotStream", () => {
     },
   );
 
+  it("keeps usage-limit reset details through the turn_end + recovery_state sequence", () => {
+    const fake = fakeClient();
+    const { result } = renderHook(() => useNanobotStream("chat-limit-recovery", EMPTY_MESSAGES), {
+      wrapper: wrap(fake.client),
+    });
+    act(() => {
+      fake.emit("chat-limit-recovery", {
+        event: "turn_end", chat_id: "chat-limit-recovery", turn_id: "limit-turn",
+        outcome: "failed", failure_kind: "model", failure_error_kind: "usage_limit",
+        failure_reset_time: "1pm", failure_reset_timezone: "America/Vancouver",
+      });
+    });
+    expect(result.current.streamError).toMatchObject({
+      kind: "model_request_failed",
+      errorKind: "usage_limit",
+      resetTime: "1pm",
+      resetTimezone: "America/Vancouver",
+    });
+    act(() => {
+      fake.emit("chat-limit-recovery", {
+        event: "recovery_state", chat_id: "chat-limit-recovery",
+        recovery_id: "limit-recovery-1", status: "awaiting_user",
+        reason: "model_request_failed", failure_error_kind: "usage_limit",
+        failure_reset_time: "1pm", failure_reset_timezone: "America/Vancouver",
+      });
+    });
+    // The recovery surface replaces the transient stream error, but must
+    // keep the validated reset details instead of regressing to a generic
+    // message.
+    expect(result.current.streamError).toBeNull();
+    expect(result.current.recoveryState).toEqual({
+      status: "awaiting_user",
+      recovery_id: "limit-recovery-1",
+      reason: "model_request_failed",
+      failure_error_kind: "usage_limit",
+      failure_reset_time: "1pm",
+      failure_reset_timezone: "America/Vancouver",
+    });
+  });
+
+  it("rebuilds the usage-limit recovery notice from attached state after a reload", () => {
+    // A fresh client attaches to a session whose durable recovery state
+    // already carries the validated limit-reset details.
+    const fake = fakeClient();
+    const { result } = renderHook(() => useNanobotStream("chat-limit-attach", EMPTY_MESSAGES), {
+      wrapper: wrap(fake.client),
+    });
+    act(() => {
+      fake.emit("chat-limit-attach", {
+        event: "attached", chat_id: "chat-limit-attach",
+        recovery_state: {
+          recovery_id: "limit-recovery-1", status: "awaiting_user",
+          reason: "model_request_failed", failure_error_kind: "usage_limit",
+          failure_reset_time: "1pm", failure_reset_timezone: "America/Vancouver",
+        },
+      });
+    });
+    expect(result.current.streamError).toBeNull();
+    expect(result.current.recoveryState).toEqual({
+      status: "awaiting_user",
+      recovery_id: "limit-recovery-1",
+      reason: "model_request_failed",
+      failure_error_kind: "usage_limit",
+      failure_reset_time: "1pm",
+      failure_reset_timezone: "America/Vancouver",
+    });
+  });
+
+  it("keeps ordinary model failures on the generic recovery copy", () => {
+    const fake = fakeClient();
+    const { result } = renderHook(() => useNanobotStream("chat-plain-failure", EMPTY_MESSAGES), {
+      wrapper: wrap(fake.client),
+    });
+    act(() => {
+      fake.emit("chat-plain-failure", {
+        event: "turn_end", chat_id: "chat-plain-failure",
+        outcome: "failed", failure_kind: "model", failure_error_kind: "connection",
+      });
+    });
+    expect(result.current.streamError).toMatchObject({
+      kind: "model_request_failed",
+      errorKind: "connection",
+    });
+    act(() => {
+      fake.emit("chat-plain-failure", {
+        event: "recovery_state", chat_id: "chat-plain-failure",
+        recovery_id: "plain-1", status: "awaiting_user",
+        reason: "model_request_failed", failure_error_kind: "connection",
+      });
+    });
+    expect(result.current.streamError).toBeNull();
+    expect(result.current.recoveryState).toEqual({
+      status: "awaiting_user",
+      recovery_id: "plain-1",
+      reason: "model_request_failed",
+      failure_error_kind: "connection",
+    });
+    expect(result.current.recoveryState?.failure_reset_time).toBeUndefined();
+    expect(result.current.recoveryState?.failure_reset_timezone).toBeUndefined();
+  });
+
   it.each([true, false, undefined])("keeps saved-reply facts consistent live and on attach (%s)", (preserved) => {
     const fake = fakeClient();
     const { result } = renderHook(() => useNanobotStream("chat-preserved", EMPTY_MESSAGES), {

@@ -16,6 +16,7 @@ from nanobot.bus.outbound_events import (
     outbound_message_for_event,
 )
 from nanobot.bus.queue import MessageBus
+from nanobot.providers.base import valid_reset_clock, valid_reset_timezone
 from nanobot.session import turn_continuation
 from nanobot.session.display_history import HistoryFact, HistoryKind, HistoryReader
 from nanobot.session.history_visibility import is_hidden_history_message
@@ -160,6 +161,8 @@ class RecoveryCoordinator:
     async def turn_completed(
         self, session_key: str, *, failure_kind: str | None = None,
         failure_error_kind: str | None = None,
+        failure_reset_time: str | None = None,
+        failure_reset_timezone: str | None = None,
     ) -> None:
         """Offer explicit continuation of committed model failures or resolve recovery."""
         chat_id = webui_chat_id(session_key)
@@ -185,6 +188,15 @@ class RecoveryCoordinator:
                 can_continue=not input_rejected and any(message.get("role") == "user" for message in session.messages),
             )
             result["failure_error_kind"] = failure_error_kind or "unknown"
+            if (
+                failure_error_kind == "usage_limit"
+                and isinstance(failure_reset_time, str)
+                and isinstance(failure_reset_timezone, str)
+                and valid_reset_clock(failure_reset_time)
+                and valid_reset_timezone(failure_reset_timezone)
+            ):
+                result["failure_reset_time"] = failure_reset_time
+                result["failure_reset_timezone"] = failure_reset_timezone
             if reply_preserved:
                 result["reply_preserved"] = True
             await self.sessions.state.restore_interruption(session)
@@ -463,6 +475,8 @@ class RecoveryCoordinator:
                     can_continue=cast(bool | None, state.get("can_continue")),
                     failure_error_kind=cast(str | None, state.get("failure_error_kind")),
                     reply_preserved=cast(bool | None, state.get("reply_preserved")),
+                    failure_reset_time=cast(str | None, state.get("failure_reset_time")),
+                    failure_reset_timezone=cast(str | None, state.get("failure_reset_timezone")),
                 ),
             )
         )

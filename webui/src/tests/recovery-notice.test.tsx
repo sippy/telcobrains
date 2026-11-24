@@ -151,6 +151,47 @@ describe("RecoveryNotice", () => {
     expect(screen.getByRole("button", { name: "Continue" })).toBeEnabled();
   });
 
+  it("shows the usage-limit reset window in the recovery copy", () => {
+    render(
+      <RecoveryNotice
+        state={{
+          status: "awaiting_user",
+          recovery_id: "limit-1",
+          reason: "model_request_failed",
+          failure_error_kind: "usage_limit",
+          failure_reset_time: "1pm",
+          failure_reset_timezone: "America/Vancouver",
+        }}
+        onContinue={vi.fn().mockResolvedValue(undefined)}
+        onDismiss={vi.fn().mockResolvedValue(undefined)}
+      />,
+    );
+    expect(screen.getByRole("alert")).toHaveTextContent("Model provider usage limit reached");
+    expect(screen.getByRole("alert")).toHaveTextContent(
+      "It resets at 1pm (America/Vancouver). Try again after it resets.",
+    );
+  });
+
+  it("keeps the generic usage-limit copy when no validated reset is available", () => {
+    render(
+      <RecoveryNotice
+        state={{
+          status: "awaiting_user",
+          recovery_id: "limit-2",
+          reason: "model_request_failed",
+          failure_error_kind: "usage_limit",
+        }}
+        onContinue={vi.fn().mockResolvedValue(undefined)}
+        onDismiss={vi.fn().mockResolvedValue(undefined)}
+      />,
+    );
+    expect(screen.getByRole("alert")).toHaveTextContent("Model provider usage limit reached");
+    expect(screen.getByRole("alert")).toHaveTextContent(
+      "The provider account has reached its subscription usage limit. Check the account and try again after the limit resets.",
+    );
+    expect(screen.getByRole("alert")).not.toHaveTextContent("It resets at");
+  });
+
   it("shows model authorization recovery after loading saved state", () => {
     const onOpenSettings = vi.fn();
     render(

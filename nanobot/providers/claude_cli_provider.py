@@ -41,10 +41,8 @@ import tempfile
 import time
 from collections.abc import Sequence
 from contextlib import suppress
-from datetime import datetime
 from pathlib import Path
 from typing import Any
-from zoneinfo import ZoneInfo
 
 from loguru import logger
 
@@ -56,6 +54,8 @@ from nanobot.providers.base import (
     LLMResponse,
     ProviderCallContext,
     ProviderConversationState,
+    valid_reset_clock,
+    valid_reset_timezone,
 )
 from nanobot.providers.claude_cli_bridge import (
     BRIDGE_SERVER_NAME,
@@ -471,31 +471,6 @@ def _looks_like_session_loss(text: str) -> bool:
     )
 
 
-def _valid_reset_clock(value: str) -> bool:
-    """True when *value* is a real 12-hour clock such as ``1pm`` or ``3:30pm``."""
-    clock, suffix = value[:-2], value[-2:]
-    for fmt in ("%I:%M", "%I"):
-        try:
-            datetime.strptime(f"{clock}{suffix.upper()}", fmt + "%p")
-            return True
-        except ValueError:
-            continue
-    return False
-
-
-def _valid_reset_timezone(value: str) -> bool:
-    """True when *value* is a valid IANA time zone name.
-
-    The caller's allowlist restricts the shape to zone-name characters (no
-    dots or leading slash), so this can never be read as a filesystem path.
-    """
-    try:
-        ZoneInfo(value)
-    except (KeyError, ValueError, OSError, TypeError):
-        return False
-    return True
-
-
 def _parse_usage_limit_reset(text: str) -> tuple[str, str] | None:
     """Extract a clean ``(clock, IANA zone)`` pair from a usage-limit message.
 
@@ -507,7 +482,7 @@ def _parse_usage_limit_reset(text: str) -> tuple[str, str] | None:
     if match is None:
         return None
     clock, zone = match.group(1), match.group(2)
-    if not _valid_reset_clock(clock) or not _valid_reset_timezone(zone):
+    if not valid_reset_clock(clock) or not valid_reset_timezone(zone):
         return None
     return clock, zone
 

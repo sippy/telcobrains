@@ -902,6 +902,99 @@ async def test_usage_limit_failure_keeps_its_public_kind_on_the_recovery_state(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("failure_error_kind", "reset_time", "reset_timezone", "expected"),
+    [
+        ("usage_limit", "1pm", "America/Vancouver", {"failure_reset_time": "1pm", "failure_reset_timezone": "America/Vancouver"}),
+        ("usage_limit", "3:30pm", "America/Vancouver", {"failure_reset_time": "3:30pm", "failure_reset_timezone": "America/Vancouver"}),
+        ("usage_limit", "13pm", "America/Vancouver", {}),
+        ("usage_limit", "1pm", "Not/AZone", {}),
+        ("usage_limit", "1pm", None, {}),
+        ("usage_limit", None, "America/Vancouver", {}),
+        ("rate_limit", "1pm", "America/Vancouver", {}),
+        ("connection", "1pm", "America/Vancouver", {}),
+        (None, "1pm", "America/Vancouver", {}),
+    ],
+)
+async def test_model_failure_recovery_carries_validated_usage_limit_reset_details(
+    tmp_path: Path, failure_error_kind: str | None,
+    reset_time: str | None, reset_timezone: str | None, expected: dict,
+) -> None:
+    """The exact turn_end + recovery_state sequence a live client observes.
+
+    Only validated, display-ready reset details survive into the durable
+    recovery state and the announced event; raw or foreign values are
+    dropped and ordinary failures keep their previous shape.
+    """
+    coordinator, bus, sessions = _coordinator(tmp_path)
+    session = sessions.get_or_create("websocket:chat")
+    session.messages = [{"role": "user", "content": "finish this"}]
+    _persist(sessions, session)
+
+    await coordinator.turn_completed(
+        "websocket:chat",
+        failure_kind="model",
+        failure_error_kind=failure_error_kind,
+        failure_reset_time=reset_time,
+        failure_reset_timezone=reset_timezone,
+    )
+    state = sessions.get_or_create("websocket:chat").metadata[RECOVERY_METADATA_KEY]
+    assert state["status"] == "awaiting_user"
+    assert state["failure_error_kind"] == (failure_error_kind or "unknown")
+    for key in ("failure_reset_time", "failure_reset_timezone"):
+        assert key in state if expected else key not in state, state
+    if expected:
+        assert {k: state[k] for k in expected} == expected
+
+    event = bus.outbound.get_nowait().event
+    assert isinstance(event, RecoveryStateEvent)
+    assert event.status == "awaiting_user"
+    assert event.failure_reset_time == expected.get("failure_reset_time")
+    assert event.failure_reset_timezone == expected.get("failure_reset_timezone")
+    bus.outbound.get_nowait()  # SessionUpdatedEvent
+
+    from nanobot.session.recovery import recovery_state_from_metadata
+    public_state = recovery_state_from_metadata({RECOVERY_METADATA_KEY: state})
+    assert public_state is not None
+    assert public_state["failure_error_kind"] == (failure_error_kind or "unknown")
+    for key in ("failure_reset_time", "failure_reset_timezone"):
+        assert public_state.get(key) == expected.get(key)
+
+
+@pytest.mark.asyncio
+async def test_usage_limit_reset_details_survive_restart_and_reconnect(tmp_path: Path) -> None:
+    """A reload/reconnect rebuilds the notice from durable recovery state."""
+    coordinator, _, sessions = _coordinator(tmp_path)
+    session = sessions.get_or_create("websocket:chat")
+    session.messages = [{"role": "user", "content": "finish this"}]
+    _persist(sessions, session)
+
+    await coordinator.turn_completed(
+        "websocket:chat",
+        failure_kind="model",
+        failure_error_kind="usage_limit",
+        failure_reset_time="1pm",
+        failure_reset_timezone="America/Vancouver",
+    )
+
+    # Reopen the workspace as a restarted gateway: the notice must be
+    # rebuildable from durable state through the sanitizer that serves the
+    # attach handshake.
+    _, _, restarted = _coordinator(tmp_path)
+    session = await restarted.state.read("websocket:chat")
+    assert session is not None
+    state = session.metadata[RECOVERY_METADATA_KEY]
+    assert state["status"] == "awaiting_user"
+    from nanobot.session.recovery import recovery_state_from_metadata
+    public_state = recovery_state_from_metadata(session.metadata)
+    assert public_state is not None
+    assert public_state["status"] == "awaiting_user"
+    assert public_state["failure_error_kind"] == "usage_limit"
+    assert public_state["failure_reset_time"] == "1pm"
+    assert public_state["failure_reset_timezone"] == "America/Vancouver"
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("progress", ["none", "reply", "tool"])
 async def test_image_request_rejection_only_waits_for_recovery_when_work_is_saved(
     tmp_path: Path, progress: str,

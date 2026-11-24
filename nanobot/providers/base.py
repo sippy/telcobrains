@@ -14,6 +14,7 @@ from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
 from typing import TYPE_CHECKING, Any, Literal, cast
+from zoneinfo import ZoneInfo
 
 import json_repair
 from loguru import logger
@@ -400,6 +401,35 @@ class LLMResponse:
 
 
 _SYNTHETIC_USER_CONTENT = "(conversation continued)"
+
+
+def valid_reset_clock(value: str) -> bool:
+    """True when *value* is a real 12-hour clock such as ``1pm`` or ``3:30pm``."""
+    if not isinstance(value, str):
+        return False
+    clock, suffix = value[:-2], value[-2:]
+    for fmt in ("%I:%M", "%I"):
+        try:
+            datetime.strptime(f"{clock}{suffix.upper()}", fmt + "%p")
+            return True
+        except ValueError:
+            continue
+    return False
+
+
+def valid_reset_timezone(value: str) -> bool:
+    """True when *value* is a valid IANA time zone name.
+
+    Callers restrict the shape to zone-name characters (no dots or leading
+    slash), so this can never be read as a filesystem path.
+    """
+    if not isinstance(value, str):
+        return False
+    try:
+        ZoneInfo(value)
+    except (KeyError, ValueError, OSError, TypeError):
+        return False
+    return True
 
 
 class LLMProvider(ABC):

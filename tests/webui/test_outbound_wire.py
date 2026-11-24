@@ -59,6 +59,52 @@ def test_encode_recovery_state_omits_absent_optional_fields() -> None:
     }
 
 
+@pytest.mark.parametrize(
+    ("failure_error_kind", "reset_time", "reset_timezone"),
+    [
+        ("usage_limit", "1pm", "America/Vancouver"),
+        ("usage_limit", "1pm", None),
+        ("usage_limit", None, "America/Vancouver"),
+        ("usage_limit", None, None),
+        ("rate_limit", "1pm", "America/Vancouver"),
+        ("connection", "1pm", "America/Vancouver"),
+        (None, "1pm", "America/Vancouver"),
+    ],
+)
+def test_encode_recovery_state_scopes_reset_details_to_usage_limit(
+    failure_error_kind: str | None, reset_time: str | None, reset_timezone: str | None,
+) -> None:
+    payload = encode_recovery_state(
+        "chat-1",
+        RecoveryStateEvent(
+            status="awaiting_user",
+            recovery_id="recovery-1",
+            reason="model_request_failed",
+            failure_error_kind=failure_error_kind,
+            failure_reset_time=reset_time,
+            failure_reset_timezone=reset_timezone,
+        ),
+    )
+    expected = {
+        "event": "recovery_state",
+        "chat_id": "chat-1",
+        "status": "awaiting_user",
+        "recovery_id": "recovery-1",
+        "attempts": 0,
+        "reason": "model_request_failed",
+    }
+    if failure_error_kind is not None:
+        expected["failure_error_kind"] = failure_error_kind
+    if (
+        failure_error_kind == "usage_limit"
+        and reset_time is not None
+        and reset_timezone is not None
+    ):
+        expected["failure_reset_time"] = reset_time
+        expected["failure_reset_timezone"] = reset_timezone
+    assert payload == expected
+
+
 def test_encode_recovery_state_preserves_false_can_continue() -> None:
     payload = encode_recovery_state(
         "chat-1",

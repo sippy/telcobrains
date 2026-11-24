@@ -94,6 +94,10 @@ class RecoveryStateEvent(AgentEvent):
     can_continue: bool | None = None
     failure_error_kind: str | None = None
     reply_preserved: bool | None = None
+    # Clean, display-ready limit-reset details for a usage-limit failure. Set
+    # only from validated values; raw provider text is never carried here.
+    failure_reset_time: str | None = None
+    failure_reset_timezone: str | None = None
 
 
 @dataclass(frozen=True)

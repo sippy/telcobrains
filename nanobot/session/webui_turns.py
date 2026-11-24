@@ -685,6 +685,8 @@ class WebuiTurnCoordinator:
                 event.context.session_key,
                 failure_kind=event.failure_kind,
                 failure_error_kind=event.failure_error_kind,
+                failure_reset_time=event.failure_reset_time,
+                failure_reset_timezone=event.failure_reset_timezone,
             )
         if event.outcome == "completed" and is_webui_session_key(event.context.session_key):
             turn_id = event.context.metadata.get(WEBUI_TURN_METADATA_KEY)

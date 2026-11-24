@@ -38,7 +38,11 @@ export function RecoveryNotice({ state, onContinue, onDismiss, onOpenSettings, o
 
   const contextUnavailable = state.can_continue === false;
   const modelFailure = state.reason === "model_request_failed"
-    ? resolveModelRequestFailureCopy({ errorKind: state.failure_error_kind }, t)
+    ? resolveModelRequestFailureCopy({
+        errorKind: state.failure_error_kind,
+        ...(state.failure_reset_time ? { resetTime: state.failure_reset_time } : {}),
+        ...(state.failure_reset_timezone ? { resetTimezone: state.failure_reset_timezone } : {}),
+      }, t)
     : null;
   const imageFailure = modelFailure !== null && isImageRequestFailure(state.failure_error_kind);
   const openSettings = imageFailure ? onInspectImagePreset : onOpenSettings;

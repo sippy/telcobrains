@@ -8,6 +8,10 @@ export interface RecoveryState {
   can_continue?: boolean
   failure_error_kind?: string
   reply_preserved?: boolean
+  /** Clean limit-reset clock time for a usage-limit failure (e.g. "1pm"). */
+  failure_reset_time?: string
+  /** IANA time zone for a usage-limit failure (e.g. "America/Vancouver"). */
+  failure_reset_timezone?: string
 }
 
 export type CompactionReason = "idle" | "context_pressure" | "manual" | "provider_native"
@@ -64,6 +68,8 @@ export function isRecoveryState(value: unknown): value is RecoveryState {
     && optional(value.can_continue, "boolean")
     && optional(value.failure_error_kind, "string")
     && optional(value.reply_preserved, "boolean")
+    && optional(value.failure_reset_time, "string")
+    && optional(value.failure_reset_timezone, "string")
 }
 
 /** Undefined means another protocol family; null means a malformed notification. */
