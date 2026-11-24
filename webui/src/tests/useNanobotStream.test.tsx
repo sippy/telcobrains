@@ -850,6 +850,26 @@ describe("useNanobotStream", () => {
     expect(fake.client.getRunState("chat-recovery").active).toBe(false);
   });
 
+  it("carries usage-limit reset details from turn_end into the stream error", () => {
+    const fake = fakeClient();
+    const { result } = renderHook(() => useNanobotStream("chat-usage-limit", EMPTY_MESSAGES), {
+      wrapper: wrap(fake.client),
+    });
+    act(() => {
+      fake.emit("chat-usage-limit", {
+        event: "turn_end", chat_id: "chat-usage-limit", turn_id: "limit-turn",
+        outcome: "failed", failure_kind: "model", failure_error_kind: "usage_limit",
+        failure_reset_time: "1pm", failure_reset_timezone: "America/Vancouver",
+      });
+    });
+    expect(result.current.streamError).toMatchObject({
+      kind: "model_request_failed",
+      errorKind: "usage_limit",
+      resetTime: "1pm",
+      resetTimezone: "America/Vancouver",
+    });
+  });
+
   it.each(["awaiting_user", "resuming"] as const)(
     "reconciles a missed model recovery event after reconnecting to %s",
     (status) => {

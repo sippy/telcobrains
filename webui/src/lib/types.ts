@@ -1715,6 +1715,10 @@ export type InboundEvent =
       failure_kind?: string;
       failure_error_kind?: string;
       failure_attempts?: number;
+      /** Clean limit-reset clock time for a usage-limit failure (e.g. "1pm"). */
+      failure_reset_time?: string;
+      /** IANA time zone for a usage-limit failure (e.g. "America/Vancouver"). */
+      failure_reset_timezone?: string;
       failure_message?: string;
     } & InboundTurnMetadata)
   | ({

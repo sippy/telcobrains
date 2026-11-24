@@ -181,6 +181,42 @@ async def test_delivery_maps_model_error_to_failed_turn_completion() -> None:
 
 
 @pytest.mark.asyncio
+async def test_delivery_carries_usage_limit_reset_details_on_completion() -> None:
+    bus = MessageBus()
+    seen: list[TurnCompleted] = []
+    bus.subscribe(seen.append, TurnCompleted)
+    msg = InboundMessage(
+        channel="websocket",
+        sender_id="user",
+        chat_id="chat-a",
+        content="hello",
+    )
+    delivery = TurnDeliveryFactory(bus).create(msg, msg.session_key)
+    delivery.record_stop_reason(
+        "error",
+        failure_error_kind="usage_limit",
+        failure_reset_time="1pm",
+        failure_reset_timezone="America/Vancouver",
+    )
+
+    await delivery.complete(
+        OutboundMessage(
+            channel="websocket",
+            chat_id="chat-a",
+            content="Claude Code has reached the usage limit for your plan.",
+        ),
+        publish_completion=True,
+    )
+
+    assert len(seen) == 1
+    assert seen[0].failure_kind == "model"
+    assert seen[0].failure_error_kind == "usage_limit"
+    assert seen[0].failure_reset_time == "1pm"
+    assert seen[0].failure_reset_timezone == "America/Vancouver"
+    assert bus.outbound_size == 0
+
+
+@pytest.mark.asyncio
 async def test_delivery_keeps_model_error_message_for_ordinary_channels() -> None:
     bus = MessageBus()
     msg = InboundMessage(

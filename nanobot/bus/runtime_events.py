@@ -70,6 +70,8 @@ class TurnCompleted(AgentEvent):
     failure_kind: str | None = None
     failure_error_kind: str | None = None
     failure_attempts: int | None = None
+    failure_reset_time: str | None = None
+    failure_reset_timezone: str | None = None
 
 
 @dataclass(frozen=True)
@@ -285,6 +287,8 @@ class RuntimeEventPublisher:
         failure_kind: str | None = None,
         failure_error_kind: str | None = None,
         failure_attempts: int | None = None,
+        failure_reset_time: str | None = None,
+        failure_reset_timezone: str | None = None,
         run_id: str | None = None,
     ) -> None:
         key = (session_key, run_id)
@@ -304,6 +308,8 @@ class RuntimeEventPublisher:
                 failure_kind=failure_kind,
                 failure_error_kind=failure_error_kind,
                 failure_attempts=failure_attempts,
+                failure_reset_time=failure_reset_time,
+                failure_reset_timezone=failure_reset_timezone,
             )
         )
 

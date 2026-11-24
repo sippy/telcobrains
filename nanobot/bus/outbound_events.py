@@ -74,6 +74,8 @@ class TurnEndEvent(AgentEvent):
     failure_kind: str | None = None
     failure_error_kind: str | None = None
     failure_attempts: int | None = None
+    failure_reset_time: str | None = None
+    failure_reset_timezone: str | None = None
     failure_message: str | None = None
 
 

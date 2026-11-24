@@ -161,6 +161,9 @@ class AgentRunResult:
     stop_reason: str = "completed"
     error: str | None = None
     failure_error_kind: str | None = None
+    # Clean limit-reset details for a usage-limit failure (display-ready values).
+    failure_reset_time: str | None = None
+    failure_reset_timezone: str | None = None
     tool_events: list[dict[str, str]] = field(default_factory=list)
     had_injections: bool = False
     # Unstreamed terminal content or tail; excludes any prefix already delivered.
@@ -417,6 +420,8 @@ class AgentRunner:
         round_usages: list[LLMUsage] = []
         error: str | None = None
         failure_error_kind: str | None = None
+        failure_reset_time: str | None = None
+        failure_reset_timezone: str | None = None
         stop_reason = "completed"
         tool_events: list[dict[str, str]] = []
         external_lookup_counts: dict[str, int] = {}
@@ -879,6 +884,9 @@ class AgentRunner:
                     length_recovery_parts.clear()
                     continue
                 failure_error_kind = LLMProvider.public_error_kind(response)
+                if failure_error_kind == "usage_limit":
+                    failure_reset_time = response.error_reset_time
+                    failure_reset_timezone = response.error_reset_timezone
                 break
             if is_blank_text(clean):
                 final_content = EMPTY_FINAL_RESPONSE_MESSAGE
@@ -955,6 +963,8 @@ class AgentRunner:
             stop_reason=stop_reason,
             error=error,
             failure_error_kind=failure_error_kind,
+            failure_reset_time=failure_reset_time,
+            failure_reset_timezone=failure_reset_timezone,
             tool_events=tool_events,
             had_injections=had_injections,
             pending_stream_content=pending_stream_content,

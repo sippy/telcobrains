@@ -35,13 +35,16 @@ import asyncio
 import hashlib
 import json
 import os
+import re
 import shutil
 import tempfile
 import time
 from collections.abc import Sequence
 from contextlib import suppress
+from datetime import datetime
 from pathlib import Path
 from typing import Any
+from zoneinfo import ZoneInfo
 
 from loguru import logger
 
@@ -105,6 +108,23 @@ IDENTITY_CHANGED_MESSAGE = (
 SESSION_INTERRUPTED_MESSAGE = (
     "The previous turn was interrupted, so this Claude CLI conversation can no longer be "
     "resumed. Start a new chat to continue."
+)
+USAGE_LIMIT_MESSAGE = (
+    "Claude Code has reached the usage limit for your plan. Try again after the limit resets."
+)
+USAGE_LIMIT_RESET_MESSAGE = (
+    "Claude Code has reached the usage limit for your plan. "
+    "It resets at {reset_time} ({time_zone}). Try again after it resets."
+)
+RATE_LIMIT_MESSAGE = "Claude Code is temporarily rate-limiting requests. Try again in a few minutes."
+# Stable structured code for the subscription/plan usage limit in the CLI's
+# terminal result record (``api_error``).
+_USAGE_LIMIT_API_ERROR = "usage_limit_reached"
+# The CLI reports the usage-limit reset as e.g. "resets 1pm (America/Vancouver)".
+# Accept only that exact shape: a 12-hour clock (optional :mm) and an IANA zone
+# name; both parts are validated before use.
+_RESET_DETAILS_PATTERN = re.compile(
+    r"resets (\d{1,2}(?::\d{2})?[ap]m) \(([A-Za-z_]+(?:/[A-Za-z_]+){0,2})\)"
 )
 SESSION_BINDING_MESSAGE = (
     "The recorded Claude CLI session does not match this conversation's scope; it will not be resumed."
@@ -449,6 +469,73 @@ def _looks_like_session_loss(text: str) -> bool:
         or "conversation not found" in blob
         or "session not found" in blob
     )
+
+
+def _valid_reset_clock(value: str) -> bool:
+    """True when *value* is a real 12-hour clock such as ``1pm`` or ``3:30pm``."""
+    clock, suffix = value[:-2], value[-2:]
+    for fmt in ("%I:%M", "%I"):
+        try:
+            datetime.strptime(f"{clock}{suffix.upper()}", fmt + "%p")
+            return True
+        except ValueError:
+            continue
+    return False
+
+
+def _valid_reset_timezone(value: str) -> bool:
+    """True when *value* is a valid IANA time zone name.
+
+    The caller's allowlist restricts the shape to zone-name characters (no
+    dots or leading slash), so this can never be read as a filesystem path.
+    """
+    try:
+        ZoneInfo(value)
+    except (KeyError, ValueError, OSError, TypeError):
+        return False
+    return True
+
+
+def _parse_usage_limit_reset(text: str) -> tuple[str, str] | None:
+    """Extract a clean ``(clock, IANA zone)`` pair from a usage-limit message.
+
+    Only the bounded shape ``resets <12h clock> (<IANA zone>)`` is accepted and
+    both parts are validated; anything else yields None so the caller falls
+    back to the message without a time. The raw text is never returned.
+    """
+    match = _RESET_DETAILS_PATTERN.search(text or "")
+    if match is None:
+        return None
+    clock, zone = match.group(1), match.group(2)
+    if not _valid_reset_clock(clock) or not _valid_reset_timezone(zone):
+        return None
+    return clock, zone
+
+
+def _classify_structured_api_error(
+    record: dict[str, Any],
+) -> tuple[str, str, dict[str, Any]] | None:
+    """Map the CLI's structured result error fields to fixed public errors.
+
+    Only known, stable values are interpreted: the subscription usage-limit
+    code and a 429 status. Anything else returns None so the existing
+    text-based classification applies. The extra fields carry clean display
+    values only; no raw record values are forwarded.
+    """
+    api_error = record.get("api_error")
+    if api_error == _USAGE_LIMIT_API_ERROR:
+        details = _parse_usage_limit_reset(_result_status_text(record))
+        if details is not None:
+            message = USAGE_LIMIT_RESET_MESSAGE.format(reset_time=details[0], time_zone=details[1])
+            return "usage_limit", message, {
+                "reset_time": details[0],
+                "reset_timezone": details[1],
+            }
+        return "usage_limit", USAGE_LIMIT_MESSAGE, {}
+    status = record.get("api_error_status")
+    if isinstance(status, int) and not isinstance(status, bool) and status == 429:
+        return "rate_limit", RATE_LIMIT_MESSAGE, {"status_code": 429}
+    return None
 
 
 def _classify_cli_failure(diagnostics: list[str], returncode: int | None) -> tuple[str, str]:
@@ -1331,6 +1418,16 @@ class ClaudeCLIProvider(LLMProvider):
                 )
             if _looks_like_session_loss(status):
                 return self._error("session_lost", SESSION_LOST_MESSAGE)
+            structured = _classify_structured_api_error(parsed.result_record)
+            if structured is not None:
+                kind, message, extra = structured
+                return self._error(
+                    kind,
+                    message,
+                    error_status_code=extra.get("status_code"),
+                    reset_time=extra.get("reset_time"),
+                    reset_timezone=extra.get("reset_timezone"),
+                )
             return self._error(
                 "cli_error",
                 "Claude CLI finished with an error before returning a completion.",
@@ -1339,12 +1436,23 @@ class ClaudeCLIProvider(LLMProvider):
         kind, message = _classify_cli_failure(diagnostics, returncode)
         return self._error(kind, message)
 
-    def _error(self, kind: str, message: str) -> LLMResponse:
+    def _error(
+        self,
+        kind: str,
+        message: str,
+        *,
+        error_status_code: int | None = None,
+        reset_time: str | None = None,
+        reset_timezone: str | None = None,
+    ) -> LLMResponse:
         return LLMResponse(
             content=message,
             finish_reason="error",
             error_kind=kind,
+            error_status_code=error_status_code,
             error_should_retry=False,
+            error_reset_time=reset_time,
+            error_reset_timezone=reset_timezone,
         )
 
     def _bad_request(self, message: str) -> LLMResponse:

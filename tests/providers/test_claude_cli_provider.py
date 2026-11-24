@@ -27,14 +27,17 @@ from nanobot.config.schema import (
     ProvidersConfig,
 )
 from nanobot.providers.base import (
+    LLMProvider,
     LLMResponse,
     ProviderCallContext,
     ProviderConversationState,
 )
 from nanobot.providers.claude_cli_bridge import ClaudeCodeToolBridge
 from nanobot.providers.claude_cli_provider import (
+    USAGE_LIMIT_MESSAGE,
     ClaudeCLIProvider,
     _classify_cli_failure,
+    _parse_usage_limit_reset,
     _ParsedStream,
     build_claude_cli_argv,
     clean_claude_cli_env,
@@ -395,6 +398,173 @@ async def test_error_response_never_returns_private_output(tmp_path, monkeypatch
     # Fixed diagnostic text only: no secret from either surface leaks.
     for secret in ("SECRET_STDERR_LEAK_abc123", "SECRET_RESULT_LEAK_xyz789", "abc123", "xyz789"):
         assert secret not in response.content
+
+
+def _usage_limit_record(result_text: str) -> str:
+    return (
+        '{"type":"result","subtype":"success","is_error":true,'
+        '"api_error_status":429,"api_error_origin":"first_party",'
+        '"api_error":"usage_limit_reached","terminal_reason":"api_error",'
+        f'"result":"{result_text}",'
+        '"usage":{"input_tokens":0,"output_tokens":0}}'
+    )
+
+
+def _error_record_fake_body(record: str) -> str:
+    """Fake CLI body emitting one error result record verbatim, then exit 1."""
+    return "printf '%s\\n' '" + record + "'\nexit 1\n"
+
+
+async def test_usage_limit_result_maps_to_usage_limit_with_clean_reset(
+    tmp_path, monkeypatch,
+) -> None:
+    # The real 2.1.317 terminal result for a plan usage limit.
+    out_dir = tmp_path / "out"
+    monkeypatch.setenv("CLAUDE_CLI_FAKE_DIR", str(out_dir))
+    fake = tmp_path / "claude"
+    _write_fake_cli(
+        fake,
+        _error_record_fake_body(
+            _usage_limit_record(
+                "You\\u0027ve hit your 5-hour limit \u00b7 resets 1pm (America/Vancouver)",
+            )
+        ),
+    )
+    provider = _provider(str(fake))
+    response = await provider.chat(messages=[{"role": "user", "content": "hi"}])
+
+    assert response.finish_reason == "error"
+    assert response.error_kind == "usage_limit"
+    assert LLMProvider.public_error_kind(response) == "usage_limit"
+    # No automatic retry, fallback, or replay: the error is not transient.
+    assert LLMProvider.is_transient_response(response) is False
+    # Clean, validated display fields only.
+    assert response.error_reset_time == "1pm"
+    assert response.error_reset_timezone == "America/Vancouver"
+    assert "1pm" in response.content
+    assert "America/Vancouver" in response.content
+    # The raw diagnostic is never forwarded.
+    for fragment in ("5-hour", "You\'ve hit", "usage_limit_reached", "first_party"):
+        assert fragment not in response.content
+
+
+@pytest.mark.parametrize(
+    "result_text",
+    [
+        "You\\u0027ve hit your limit",
+        "You\\u0027ve hit your limit - resets 25pm (America/Vancouver)",
+        "You\\u0027ve hit your limit - resets 1pm (Mars/Olympus)",
+        "You\\u0027ve hit your limit - resets 1pm (America)",
+        "You\\u0027ve hit your limit - resets 1 pm (America/Vancouver)",
+        "You\\u0027ve hit your limit - resets 1:5pm (America/Vancouver)",
+        "You\\u0027ve hit your limit - resets 12:60pm (America/Vancouver)",
+        "You\\u0027ve hit your limit - resets 1pm (a/b/c/d)",
+    ],
+)
+async def test_usage_limit_without_valid_reset_falls_back_to_safe_message(
+    result_text: str, tmp_path, monkeypatch,
+) -> None:
+    out_dir = tmp_path / "out"
+    monkeypatch.setenv("CLAUDE_CLI_FAKE_DIR", str(out_dir))
+    fake = tmp_path / "claude"
+    _write_fake_cli(fake, _error_record_fake_body(_usage_limit_record(result_text)))
+    provider = _provider(str(fake))
+    response = await provider.chat(messages=[{"role": "user", "content": "hi"}])
+
+    assert response.finish_reason == "error"
+    assert response.error_kind == "usage_limit"
+    assert response.error_reset_time is None
+    assert response.error_reset_timezone is None
+    assert response.content == USAGE_LIMIT_MESSAGE
+    # No partial or guessed reset details leak into the message.
+    for fragment in ("1pm", "25pm", "America/Vancouver", "Mars"):
+        assert fragment not in response.content
+
+
+async def test_transient_429_maps_to_rate_limit_without_retry(
+    tmp_path, monkeypatch,
+) -> None:
+    out_dir = tmp_path / "out"
+    monkeypatch.setenv("CLAUDE_CLI_FAKE_DIR", str(out_dir))
+    fake = tmp_path / "claude"
+    _write_fake_cli(
+        fake,
+        _error_record_fake_body(
+            '{"type":"result","subtype":"success","is_error":true,'
+            '"api_error_status":429,"api_error":"rate_limit_error",'
+            '"result":"Too many requests",'
+            '"usage":{"input_tokens":0,"output_tokens":0}}'
+        ),
+    )
+    provider = _provider(str(fake))
+    response = await provider.chat(messages=[{"role": "user", "content": "hi"}])
+
+    # A plain 429 is a transient rate limit, distinct from the plan limit.
+    assert response.finish_reason == "error"
+    assert response.error_kind == "rate_limit"
+    assert response.error_status_code == 429
+    assert LLMProvider.public_error_kind(response) == "rate_limit"
+    assert LLMProvider.is_transient_response(response) is False
+    assert response.error_reset_time is None
+    assert response.error_reset_timezone is None
+    assert "Too many requests" not in response.content
+
+
+async def test_usage_limit_error_is_never_retried_in_persistent_mode(
+    tmp_path, monkeypatch,
+) -> None:
+    out_dir = tmp_path / "out"
+    monkeypatch.setenv("CLAUDE_CLI_FAKE_DIR", str(out_dir))
+    fake = tmp_path / "claude"
+    _write_fake_cli(
+        fake,
+        _error_record_fake_body(
+            _usage_limit_record(
+                "You\\u0027ve hit your 5-hour limit \u00b7 resets 1pm (America/Vancouver)",
+            )
+        ),
+    )
+    provider = _provider(str(fake))
+    first = await provider.chat(messages=[{"role": "user", "content": "hi"}])
+
+    calls = 0
+
+    async def call(**kw):
+        nonlocal calls
+        calls += 1
+        return first
+
+    result = await provider._run_with_retry(
+        call,
+        {},
+        retry_mode="persistent",
+        on_retry_wait=None,
+        on_retry_exhausted=None,
+        on_retry_status=None,
+    )
+
+    assert calls == 1
+    assert result is first
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        ("You\'ve hit your 5-hour limit · resets 1pm (America/Vancouver)", ("1pm", "America/Vancouver")),
+        ("resets 12am (UTC)", ("12am", "UTC")),
+        ("resets 3:30pm (America/Argentina/Buenos_Aires)", ("3:30pm", "America/Argentina/Buenos_Aires")),
+        ("resets 25pm (America/Vancouver)", None),
+        ("resets 0pm (America/Vancouver)", None),
+        ("resets 1pm (Mars/Olympus)", None),
+        ("resets 1pm (America)", None),
+        ("resets 1pm (a/b/c/d)", None),
+        ("resets 1pm (America/Van couver)", None),
+        ("no reset information", None),
+        ("", None),
+    ],
+)
+def test_parse_usage_limit_reset(text: str, expected) -> None:
+    assert _parse_usage_limit_reset(text) == expected
 
 
 # -------------------------------------------------------------------------- #

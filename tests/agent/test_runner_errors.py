@@ -171,6 +171,39 @@ async def test_llm_arrearage_error_surfaces_clear_message():
 
 
 @pytest.mark.asyncio
+async def test_usage_limit_error_surfaces_clean_reset_details():
+    """A subscription usage-limit failure keeps its validated reset details."""
+    from nanobot.agent.runner import AgentRunner
+
+    provider = MagicMock(spec=LLMProvider)
+    provider.chat_stream_with_retry = AsyncMock(return_value=LLMResponse(
+        content="Claude Code has reached the usage limit for your plan. "
+                "It resets at 1pm (America/Vancouver). Try again after it resets.",
+        finish_reason="error",
+        error_kind="usage_limit",
+        error_should_retry=False,
+        error_reset_time="1pm",
+        error_reset_timezone="America/Vancouver",
+    ))
+    tools = MagicMock()
+    tools.get_definitions.return_value = []
+
+    runner = AgentRunner()
+    result = await runner.run(make_run_spec(provider,
+        initial_messages=[{"role": "user", "content": "hello"}],
+        tools=tools,
+        model="test-model",
+        max_iterations=5,
+        max_tool_result_chars=_MAX_TOOL_RESULT_CHARS,
+    ))
+
+    assert result.stop_reason == "error"
+    assert result.failure_error_kind == "usage_limit"
+    assert result.failure_reset_time == "1pm"
+    assert result.failure_reset_timezone == "America/Vancouver"
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("finish_reason", "expected_stop_reason"),
     [

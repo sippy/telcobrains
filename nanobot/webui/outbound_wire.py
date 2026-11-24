@@ -94,6 +94,8 @@ class TurnEndWirePayload(_ChatWirePayload):
     failure_kind: NotRequired[str]
     failure_error_kind: NotRequired[str]
     failure_attempts: NotRequired[int]
+    failure_reset_time: NotRequired[str]
+    failure_reset_timezone: NotRequired[str]
     failure_message: NotRequired[str]
 
 
@@ -353,6 +355,10 @@ def encode_turn_end(
         payload["failure_error_kind"] = event.failure_error_kind
     if event.failure_attempts is not None:
         payload["failure_attempts"] = int(event.failure_attempts)
+    if event.failure_reset_time is not None:
+        payload["failure_reset_time"] = event.failure_reset_time
+    if event.failure_reset_timezone is not None:
+        payload["failure_reset_timezone"] = event.failure_reset_timezone
     if event.failure_message is not None:
         payload["failure_message"] = event.failure_message
     return payload

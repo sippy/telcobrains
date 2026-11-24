@@ -163,6 +163,43 @@ def test_encode_turn_end_projects_complete_wire_contract() -> None:
     }
 
 
+def test_encode_turn_end_carries_usage_limit_reset_details() -> None:
+    usage = LLMUsage.reported(input_tokens=10, output_tokens=5).with_timing(
+        generation_ms=100, ttft_ms=20,
+    )
+    payload = encode_turn_end(
+        "chat-1",
+        TurnEndEvent(
+            latency_ms=900,
+            usage=usage,
+            outcome="failed",
+            failure_kind="model",
+            failure_error_kind="usage_limit",
+            failure_reset_time="1pm",
+            failure_reset_timezone="America/Vancouver",
+            failure_message="Model provider request failed.",
+        ),
+        {WEBUI_TURN_METADATA_KEY: "turn-9"},
+    )
+
+    assert payload["failure_error_kind"] == "usage_limit"
+    assert payload["failure_reset_time"] == "1pm"
+    assert payload["failure_reset_timezone"] == "America/Vancouver"
+
+    # Ordinary failures carry no reset details at all.
+    plain = encode_turn_end(
+        "chat-1",
+        TurnEndEvent(
+            outcome="failed",
+            failure_kind="model",
+            failure_error_kind="connection",
+        ),
+        {},
+    )
+    assert "failure_reset_time" not in plain
+    assert "failure_reset_timezone" not in plain
+
+
 @pytest.mark.parametrize("preserved", [False, True])
 def test_encode_recovery_state_reports_reply_preservation(preserved: bool) -> None:
     payload = encode_recovery_state(

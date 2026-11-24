@@ -5781,6 +5781,47 @@ describe("ThreadShell", () => {
     expect(inspectPreset).toHaveBeenCalledWith("test-vision");
   });
 
+  it("renders the usage-limit banner with the reset time and zone from the wire event", async () => {
+    const client = makeClient();
+    await act(async () => {
+      await i18n.changeLanguage("en");
+    });
+
+    render(
+      wrap(
+        client,
+        <ThreadShell
+          session={session("chat-usage-limit")}
+          title="Chat usage limit"
+          onToggleSidebar={() => {}}
+        />,
+      ),
+    );
+
+    await act(async () => {});
+    // The exact public turn_end fields the gateway sends for the observed
+    // Claude CLI 2.1.317 subscription usage-limit result.
+    act(() => {
+      client._emitChat("chat-usage-limit", {
+        event: "turn_end",
+        chat_id: "chat-usage-limit",
+        turn_id: "turn-usage-limit",
+        outcome: "failed",
+        failure_kind: "model",
+        failure_error_kind: "usage_limit",
+        failure_reset_time: "1pm",
+        failure_reset_timezone: "America/Vancouver",
+      });
+    });
+
+    const banner = await screen.findByRole("alert");
+    expect(banner).toHaveTextContent("Model provider usage limit reached");
+    expect(banner).toHaveTextContent("It resets at 1pm (America/Vancouver).");
+    // The raw CLI diagnostic is never forwarded to the UI.
+    expect(banner).not.toHaveTextContent("5-hour limit");
+    expect(banner).not.toHaveTextContent("You\u0027ve hit");
+  });
+
   it.each([false, true])("keeps one terminal model failure visible until the next user action (recovery: %s)", async (recoverable) => {
     const client = makeClient();
     await act(async () => {

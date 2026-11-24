@@ -375,6 +375,11 @@ class LLMResponse:
     error_code: str | None = None  # Provider/code semantic, e.g. rate_limit_exceeded.
     error_retry_after_s: float | None = None
     error_should_retry: bool | None = None
+    # Clean, display-ready limit-reset details (e.g. a subscription usage
+    # limit's reset clock time and IANA time zone). Providers set these only
+    # from validated, bounded values; raw provider text is never stored here.
+    error_reset_time: str | None = field(default=None, repr=False)
+    error_reset_timezone: str | None = field(default=None, repr=False)
     # A failed fallback must not replace the selected model's public diagnosis.
     # Keep this separate from the last response's retry policy.
     primary_error_kind: str | None = field(default=None, repr=False)
@@ -1613,7 +1618,7 @@ class LLMProvider(ABC):
         # A plain 403 can be a policy or permission rejection, not bad credentials.
         if kind in {"authentication", "oauth_auth_required"} or response.error_status_code == 401:
             return "authentication"
-        if kind in {"connection", "timeout", "image_request_rejected"}:
+        if kind in {"connection", "timeout", "image_request_rejected", "usage_limit"}:
             return kind
         if response.error_status_code == 429:
             return "rate_limit"

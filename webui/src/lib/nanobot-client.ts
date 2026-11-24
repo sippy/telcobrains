@@ -131,6 +131,10 @@ export type StreamError =
       turnId?: string;
       errorKind?: string;
       attempts?: number;
+      /** Clean limit-reset clock time for a usage-limit failure (e.g. "1pm"). */
+      resetTime?: string;
+      /** IANA time zone for a usage-limit failure (e.g. "America/Vancouver"). */
+      resetTimezone?: string;
     };
 
 type ErrorHandler = (error: StreamError) => void;

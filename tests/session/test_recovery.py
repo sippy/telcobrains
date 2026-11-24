@@ -881,6 +881,27 @@ async def test_model_failure_waits_across_restart_and_rejects_duplicate_continue
 
 
 @pytest.mark.asyncio
+async def test_usage_limit_failure_keeps_its_public_kind_on_the_recovery_state(
+    tmp_path: Path,
+) -> None:
+    coordinator, bus, sessions = _coordinator(tmp_path)
+    session = sessions.get_or_create("websocket:chat")
+    session.messages = [{"role": "user", "content": "finish this"}]
+    _persist(sessions, session)
+
+    await coordinator.turn_completed(
+        "websocket:chat", failure_kind="model", failure_error_kind="usage_limit",
+    )
+    state = sessions.get_or_create("websocket:chat").metadata[RECOVERY_METADATA_KEY]
+    assert state["status"] == "awaiting_user"
+    assert state["failure_error_kind"] == "usage_limit"
+    from nanobot.session.recovery import recovery_state_from_metadata
+    public_state = recovery_state_from_metadata({RECOVERY_METADATA_KEY: state})
+    assert public_state is not None
+    assert public_state["failure_error_kind"] == "usage_limit"
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("progress", ["none", "reply", "tool"])
 async def test_image_request_rejection_only_waits_for_recovery_when_work_is_saved(
     tmp_path: Path, progress: str,

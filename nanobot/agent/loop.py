@@ -167,6 +167,8 @@ class TurnContext:
     all_messages: list[dict[str, Any]] = field(default_factory=list)
     stop_reason: str = ""
     failure_error_kind: str | None = None
+    failure_reset_time: str | None = None
+    failure_reset_timezone: str | None = None
     streamed_content: bool = False
 
     input_persisted_early: bool = False
@@ -2381,6 +2383,8 @@ class AgentLoop:
         ctx.provider_compaction_applied = result.provider_compaction_applied
         ctx.stop_reason = result.stop_reason
         ctx.failure_error_kind = result.failure_error_kind
+        ctx.failure_reset_time = result.failure_reset_time
+        ctx.failure_reset_timezone = result.failure_reset_timezone
         if (
             ctx.kind is TurnKind.USER
             and (ctx.delivery.route.channel, ctx.delivery.route.chat_id) in message_sends
@@ -2450,6 +2454,8 @@ class AgentLoop:
         ctx.delivery.record_stop_reason(
             ctx.stop_reason,
             failure_error_kind=ctx.failure_error_kind,
+            failure_reset_time=ctx.failure_reset_time,
+            failure_reset_timezone=ctx.failure_reset_timezone,
         )
         if ctx.suppress_response:
             ctx.outbound = None

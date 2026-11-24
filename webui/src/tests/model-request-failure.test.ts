@@ -5,7 +5,7 @@ import { resolveModelRequestFailureCopy } from "@/lib/model-request-failure";
 
 describe("model request failure copy", () => {
   it("maps every sanitized provider error category to a specific cause", () => {
-    const titles = ["authentication", "billing", "connection", "timeout", "rate_limit", "server", "unknown"].map(
+    const titles = ["authentication", "billing", "connection", "timeout", "rate_limit", "usage_limit", "server", "unknown"].map(
       (errorKind) => resolveModelRequestFailureCopy({ errorKind }, i18n.t).title,
     );
 
@@ -15,9 +15,28 @@ describe("model request failure copy", () => {
       "Model connection failed",
       "Model provider request timed out",
       "Model provider rate limit reached",
+      "Model provider usage limit reached",
       "Model provider service error",
       "Model provider request failed",
     ]);
+  });
+
+  it("reports the usage-limit reset time and zone from clean fields only", () => {
+    expect(resolveModelRequestFailureCopy(
+      { errorKind: "usage_limit", resetTime: "1pm", resetTimezone: "America/Vancouver" },
+      i18n.t,
+    ).body).toBe(
+      "The provider account has reached its subscription usage limit. It resets at 1pm (America/Vancouver). Try again after it resets.",
+    );
+  });
+
+  it("falls back to the safe usage-limit copy when the reset details are absent", () => {
+    expect(resolveModelRequestFailureCopy(
+      { errorKind: "usage_limit" },
+      i18n.t,
+    ).body).toBe(
+      "The provider account has reached its subscription usage limit. Check the account and try again after the limit resets.",
+    );
   });
 
   it("reports the final attempt and a concrete recovery action", () => {

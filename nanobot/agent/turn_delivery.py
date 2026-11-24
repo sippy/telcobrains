@@ -213,6 +213,8 @@ class TurnDelivery:
     completed: bool = field(init=False, default=False)
     _stop_reason: str | None = field(init=False, default=None)
     _failure_error_kind: str | None = field(init=False, default=None)
+    _failure_reset_time: str | None = field(init=False, default=None)
+    _failure_reset_timezone: str | None = field(init=False, default=None)
     _retry_status: RetryStatusEvent | None = field(init=False, default=None)
     _response_input_ids: tuple[str, ...] | None = field(init=False, default=None)
     _response_source: ResponseSource | None = field(init=False, default=None)
@@ -320,9 +322,13 @@ class TurnDelivery:
         stop_reason: str,
         *,
         failure_error_kind: str | None = None,
+        failure_reset_time: str | None = None,
+        failure_reset_timezone: str | None = None,
     ) -> None:
         self._stop_reason = stop_reason
         self._failure_error_kind = failure_error_kind
+        self._failure_reset_time = failure_reset_time
+        self._failure_reset_timezone = failure_reset_timezone
 
     def background_response(
         self,
@@ -411,6 +417,16 @@ class TurnDelivery:
                 failure_attempts=(
                     self._retry_status.attempt if failure_kind == "model" and self._retry_status else None
                 ),
+                failure_reset_time=(
+                    self._failure_reset_time
+                    if failure_kind == "model" and self._failure_error_kind == "usage_limit"
+                    else None
+                ),
+                failure_reset_timezone=(
+                    self._failure_reset_timezone
+                    if failure_kind == "model" and self._failure_error_kind == "usage_limit"
+                    else None
+                ),
             )
 
     async def cancelled(self) -> None:
@@ -432,6 +448,7 @@ class TurnDelivery:
         self, *, outcome: str, channel: str | None = None, chat_id: str | None = None,
         failure_kind: str | None = None, failure_error_kind: str | None = None,
         failure_attempts: int | None = None,
+        failure_reset_time: str | None = None, failure_reset_timezone: str | None = None,
     ) -> None:
         if self.completed:
             return
@@ -446,6 +463,8 @@ class TurnDelivery:
                 failure_kind=failure_kind,
                 failure_error_kind=failure_error_kind,
                 failure_attempts=failure_attempts,
+                failure_reset_time=failure_reset_time,
+                failure_reset_timezone=failure_reset_timezone,
                 run_id=self.run_id,
             )
             self.completed = True

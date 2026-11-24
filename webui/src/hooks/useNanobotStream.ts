@@ -802,6 +802,12 @@ export function useNanobotStream(
                 ? { errorKind: ev.failure_error_kind }
                 : {}),
               ...(failureAttempts !== undefined ? { attempts: failureAttempts } : {}),
+              ...(typeof ev.failure_reset_time === "string"
+                ? { resetTime: ev.failure_reset_time }
+                : {}),
+              ...(typeof ev.failure_reset_timezone === "string"
+                ? { resetTimezone: ev.failure_reset_timezone }
+                : {}),
             }
           : null;
         // Recovery decides whether an image failure needs an action card or just a toast.
