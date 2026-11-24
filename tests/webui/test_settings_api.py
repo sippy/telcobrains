@@ -1431,6 +1431,96 @@ def test_settings_payload_marks_dynamic_custom_provider_without_api_base_unconfi
     assert providers[DYNAMIC_PROVIDER_NAME]["api_base"] is None
 
 
+def _fake_cli_executable(tmp_path, name: str = "claude") -> str:
+    binary = tmp_path / name
+    binary.write_text("#!/bin/sh\n")
+    binary.chmod(0o755)
+    return str(binary)
+
+
+def test_settings_payload_reports_claude_cli_setup_from_local_executable(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config_path = tmp_path / "config.json"
+    command = _fake_cli_executable(tmp_path)
+    config = Config.model_validate(
+        {
+            "providers": {"claude_cli": {"command": command}},
+            "modelPresets": {
+                "claude-haiku": {
+                    "model": "claude_cli/haiku",
+                    "provider": "claude_cli",
+                }
+            },
+        }
+    )
+    save_config(config, config_path)
+    monkeypatch.setattr("nanobot.config.loader._current_config_path", config_path)
+    # The settings hot path must never spawn the CLI (e.g. `claude auth status`);
+    # readiness is filesystem resolution of the configured command only.
+    monkeypatch.setattr(
+        "nanobot.providers.claude_cli_provider.spawn_process_tree",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("settings must not spawn the Claude CLI"),
+        ),
+    )
+
+    payload = settings_payload()
+    providers = {row["name"]: row for row in payload["providers"]}
+
+    row = providers["claude_cli"]
+    assert row["auth_type"] == "cli"
+    assert row["configured"] is True
+    assert row["api_key_required"] is False
+    assert row["api_key_hint"] is None
+    assert row["api_base"] is None
+    assert row["cli_command"] == command
+    assert "oauth_account" not in row
+
+    preset = next(p for p in payload["model_presets"] if p["name"] == "claude-haiku")
+    assert preset["resolved_provider"] == "claude_cli"
+
+    # Adding a preset on this provider needs no key or base.
+    created = create_model_configuration(
+        {
+            "name": ["cli-preset"],
+            "model": ["claude_cli/sonnet"],
+            "provider": ["claude_cli"],
+        }
+    )
+    assert created["created_model_preset"] == "cli-preset"
+    saved = load_config(config_path)
+    assert saved.model_presets["cli-preset"].provider == "claude_cli"
+
+
+def test_settings_payload_marks_claude_cli_unconfigured_when_executable_missing(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config_path = tmp_path / "config.json"
+    missing = str(tmp_path / "missing" / "claude")
+    config = Config.model_validate(
+        {"providers": {"claude_cli": {"command": missing}}}
+    )
+    save_config(config, config_path)
+    monkeypatch.setattr("nanobot.config.loader._current_config_path", config_path)
+
+    payload = settings_payload()
+    providers = {row["name"]: row for row in payload["providers"]}
+
+    assert providers["claude_cli"]["configured"] is False
+
+    with pytest.raises(WebUISettingsError, match="provider is not configured"):
+        create_model_configuration(
+            {
+                "name": ["cli-preset"],
+                "model": ["claude_cli/haiku"],
+                "provider": ["claude_cli"],
+            }
+        )
+
+
 def test_settings_payload_includes_network_safety_fields(
     tmp_path,
     monkeypatch: pytest.MonkeyPatch,

@@ -603,8 +603,11 @@ export function ProvidersSettings({
     ? settings.providers.find((provider) => provider.name === view.name)
     : null;
   useEffect(() => {
-    if (view.kind === "provider" && view.adding && selectedProvider?.auth_type === "oauth"
+    if (view.kind === "provider" && view.adding
+      && (selectedProvider?.auth_type === "oauth" || selectedProvider?.auth_type === "cli")
       && selectedProvider.configured && !providerSaving && onProviderAdded) {
+      // OAuth and local CLI providers are ready once authenticated on the host;
+      // there is no key or base to collect, so adding completes immediately.
       onProviderAdded(view.name);
       onResetProviderDraft(view.name);
       onClose();
@@ -656,6 +659,10 @@ export function ProvidersSettings({
   const renderProviderForm = (provider: SettingsPayload["providers"][number]) => {
     const form = providerForms[provider.name] ?? providerFormFromRow(provider);
     const saving = providerSaving === provider.name;
+    const isCliProvider = provider.auth_type === "cli";
+    const cliPresets = isCliProvider
+      ? settings.model_presets.filter((preset) => !preset.is_default && preset.provider === provider.name)
+      : [];
     const isOauthProvider = provider.auth_type === "oauth";
     const oauthAuthenticated = provider.configured;
     const supportsOauthAdvancedSettings =
@@ -712,7 +719,69 @@ export function ProvidersSettings({
             {supportName && capabilityError ? (
               <p className="text-[12px] text-destructive">{capabilityError}</p>
             ) : null}
-            {isOauthProvider ? (
+            {isCliProvider ? (
+              <>
+                <div className="flex flex-col gap-3 rounded-floating border border-border/45 bg-background/75 px-4 py-3">
+                  <div className="min-w-0">
+                    <p className="text-[13px] font-semibold text-foreground">
+                      {provider.configured
+                        ? tx("settings.providers.cliReady", "Ready")
+                        : tx("settings.providers.cliNotFound", "Claude CLI not found")}
+                    </p>
+                    <p className="mt-1 text-[12px] leading-5 text-muted-foreground">
+                      {provider.configured
+                        ? tx(
+                            "settings.providers.cliReadyHelp",
+                            "Claude CLI runs with the existing local Claude Code login on this host (managed with claude auth login). No API key or base URL is used.",
+                          )
+                        : tx(
+                            "settings.providers.cliNotFoundHelp",
+                            "Install Claude Code or set providers.claude_cli.command in the config to the full path of the installed claude executable, then reload Settings.",
+                          )}
+                    </p>
+                  </div>
+                  <div>
+                    <span className="block text-[12px] font-medium text-muted-foreground">
+                      {tx("settings.providers.cliCommand", "Command")}
+                    </span>
+                    <p className="mt-1 font-mono text-[12px] text-foreground">{provider.cli_command ?? "claude"}</p>
+                  </div>
+                </div>
+                <div className="rounded-floating border border-border/45 bg-background/75 px-4 py-3">
+                  <p className="text-[12px] font-medium text-muted-foreground">
+                    {tx("settings.providers.cliPresets", "Model presets")}
+                  </p>
+                  {cliPresets.length > 0 ? (
+                    <ul className="mt-1.5 space-y-1">
+                      {cliPresets.map((preset) => (
+                        <li key={preset.name} className="flex min-w-0 items-baseline gap-3 text-[12px]">
+                          <span className="shrink-0 font-medium text-foreground">{preset.name}</span>
+                          <span className="truncate font-mono text-[12px] text-muted-foreground">{preset.model}</span>
+                        </li>
+                      ))}
+                    </ul>
+                  ) : (
+                    <p className="mt-1 text-[12px] leading-5 text-muted-foreground">
+                      {tx(
+                        "settings.providers.cliPresetsEmpty",
+                        "No presets use this provider yet. Create a preset with a model like claude_cli/haiku.",
+                      )}
+                    </p>
+                  )}
+                </div>
+                <div className="flex flex-wrap items-center justify-end gap-2 py-3">
+                  <Button
+                    size="sm"
+                    variant="ghost"
+                    onClick={returnFromEditor}
+                    disabled={saving}
+                    className="rounded-full"
+                  >
+                    {t("settings.actions.cancel")}
+                  </Button>
+                </div>
+              </>
+            ) : isOauthProvider ? (
               <>
                 <div className="flex flex-col gap-3 rounded-floating border border-border/45 bg-background/75 px-4 py-3 sm:flex-row sm:items-center sm:justify-between">
                   <div className="min-w-0">

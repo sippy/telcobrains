@@ -301,6 +301,33 @@ def clean_claude_cli_env(base_env: dict[str, str] | None = None) -> dict[str, st
     return source
 
 
+def resolve_claude_cli_command(command: str) -> str | None:
+    """Resolve *command* to an absolute ``claude`` path, or None when not found.
+
+    The gateway service PATH may omit the user's local install directory
+    (e.g. ``~/.local/bin``), so a bare command is searched there too before
+    falling back to the ambient PATH. A configured absolute path is used as-is.
+    This only inspects the filesystem; it never spawns the CLI.
+    """
+    command = (command or "").strip()
+    if not command:
+        command = "claude"
+    if os.path.isabs(command):
+        if os.path.isfile(command) and os.access(command, os.X_OK):
+            return command
+        return None
+    home = Path.home()
+    user_local_dirs = (
+        str(home / ".local" / "bin"),
+        str(home / ".claude" / "local" / "bin"),
+    )
+    ambient_path = os.environ.get("PATH", "")
+    candidates = list(user_local_dirs)
+    if ambient_path:
+        candidates.append(ambient_path)
+    return shutil.which(command, path=os.pathsep.join(candidates))
+
+
 def _build_cli_path(ambient: str | None, executable_dir: str) -> str:
     """Build a usable PATH for the CLI process.
 
@@ -1060,30 +1087,19 @@ class ClaudeCLIProvider(LLMProvider):
         (e.g. ``~/.local/bin``), so a bare ``claude`` is searched there too before
         falling back to the ambient PATH. A configured absolute path is used as-is.
         """
-        command = self.command
+        resolved = resolve_claude_cli_command(self.command)
+        if resolved is not None:
+            return resolved
+        command = self.command or "claude"
         if os.path.isabs(command):
-            if os.path.isfile(command) and os.access(command, os.X_OK):
-                return command
             raise _SpawnError(
                 f"Claude CLI executable not found at the configured path: {command}. "
                 "Set providers.claude_cli.command to the installed `claude`."
             )
-        home = Path.home()
-        user_local_dirs = (
-            str(home / ".local" / "bin"),
-            str(home / ".claude" / "local" / "bin"),
+        raise _SpawnError(
+            f"Claude CLI executable not found: {command}. Install Claude Code or set "
+            "providers.claude_cli.command to its full path."
         )
-        ambient_path = os.environ.get("PATH", "")
-        candidates = list(user_local_dirs)
-        if ambient_path:
-            candidates.append(ambient_path)
-        resolved = shutil.which(command, path=os.pathsep.join(candidates))
-        if resolved is None:
-            raise _SpawnError(
-                f"Claude CLI executable not found: {command}. Install Claude Code or set "
-                "providers.claude_cli.command to its full path."
-            )
-        return resolved
 
     async def _run_completion(
         self,

@@ -28,6 +28,7 @@ from nanobot.config.schema import (
     ModelPresetConfig,
     ProviderConfig,
 )
+from nanobot.providers.claude_cli_provider import resolve_claude_cli_command
 from nanobot.providers.image_generation import get_image_gen_provider
 from nanobot.providers.model_options import (
     CODEX_ULTRAFAST_MODELS,
@@ -219,6 +220,14 @@ def provider_configured_for_settings(
 ) -> bool:
     if spec.is_oauth:
         return bool(oauth_status(spec)["configured"])
+    if spec.backend == "claude_cli":
+        # Local CLI route: readiness is the installed CLI (its configured
+        # command must resolve on this host), not HTTP credentials. The CLI
+        # owns its local login, which is not verified here — settings hot
+        # paths must not spawn ``claude auth status``.
+        return resolve_claude_cli_command(
+            getattr(provider_config, "command", None) or "claude"
+        ) is not None
     if provider_requires_api_base(spec):
         return bool(provider_config.api_base)
     if provider_requires_api_key(spec):
@@ -291,6 +300,7 @@ def _provider_settings_row(
     oauth_status_reader: OAuthStatusReader,
 ) -> dict[str, Any]:
     oauth_status = oauth_status_reader(spec) if spec.is_oauth else None
+    is_cli_provider = spec.backend == "claude_cli"
     request_apis = (
         provider_config.api.supported_apis
         if provider_config.api is not None and spec.is_direct else spec.request_apis
@@ -304,7 +314,9 @@ def _provider_settings_row(
             if oauth_status is not None
             else provider_configured_for_settings(spec, provider_config, oauth_status_reader)
         ),
-        "auth_type": "oauth" if spec.is_oauth else "api_key",
+        "auth_type": (
+            "oauth" if spec.is_oauth else ("cli" if is_cli_provider else "api_key")
+        ),
         "api_key_required": provider_requires_api_key(spec),
         "api_key_hint": mask_secret_hint(provider_config.api_key),
         "api_base": provider_config.api_base,
@@ -328,6 +340,10 @@ def _provider_settings_row(
     }
     if spec.backend == "openai_codex":
         row["codex_ultrafast_models"] = list(CODEX_ULTRAFAST_MODELS)
+    if is_cli_provider:
+        # The local CLI command is the only credential-free setting for this
+        # route; the WebUI shows it for status and guidance, never a key/base.
+        row["cli_command"] = str(getattr(provider_config, "command", None) or "claude")
     if oauth_status is not None:
         row["oauth_account"] = oauth_status["account"]
         row["oauth_expires_at"] = oauth_status["expires_at"]

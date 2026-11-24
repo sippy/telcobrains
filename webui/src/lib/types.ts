@@ -814,9 +814,15 @@ export interface SettingsPayload {
     label: string;
     is_custom?: boolean;
     configured: boolean;
-    auth_type?: "api_key" | "oauth";
+    /**
+     * "cli" marks a local CLI route (Claude Code): readiness is the installed
+     * executable, the CLI owns its local login, and no key/base is ever asked.
+     */
+    auth_type?: "api_key" | "oauth" | "cli";
     api_key_required?: boolean;
     api_key_hint?: string | null;
+    /** Configured local CLI command, for cli-authenticated providers. */
+    cli_command?: string | null;
     api_base?: string | null;
     default_api_base?: string | null;
     model_selectable?: boolean;

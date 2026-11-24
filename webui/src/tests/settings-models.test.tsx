@@ -1636,6 +1636,41 @@ describe("Settings models", () => {
     expect(await screen.findByRole("button", { name: "Sign in" })).toBeInTheDocument();
   });
 
+  it.each([true, false])("tracks the Claude CLI preset readiness from local CLI setup (configured: %s)", async (configured) => {
+    const payload: SettingsPayload = {
+      ...settingsPayload(),
+      model_presets: [
+        {
+          ...settingsPayload().model_presets[0],
+          name: "claude-haiku",
+          model: "claude_cli/haiku",
+          provider: "claude_cli",
+          resolved_provider: "claude_cli",
+        },
+      ],
+      model_call_order: ["claude-haiku"],
+      model_call_order_editable: true,
+      providers: [{
+        name: "claude_cli",
+        label: "Claude CLI",
+        configured,
+        auth_type: "cli" as const,
+        api_key_required: false,
+        cli_command: "claude",
+      }],
+    };
+    vi.stubGlobal("fetch", vi.fn(() => new Promise<Response>(() => {})));
+
+    renderSettingsView({ initialSection: "models", initialSettings: payload });
+
+    expect(screen.getByText("claude-haiku")).toBeInTheDocument();
+    if (configured) {
+      expect(screen.queryByText("Provider setup required")).not.toBeInTheDocument();
+    } else {
+      expect(screen.getByText("Provider setup required")).toBeInTheDocument();
+    }
+  });
+
   it("keeps unsigned OAuth providers out of the active provider picker", async () => {
     const payload: SettingsPayload = {
       ...settingsPayload(),

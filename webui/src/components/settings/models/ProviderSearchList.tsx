@@ -114,7 +114,8 @@ export function ProviderSearchList({ providers, showBrandLogos, query, onQueryCh
 
 function providerGroup(provider: SettingsPayload["providers"][number]): typeof PROVIDER_GROUPS[number]["id"] {
   if (provider.auth_type === "oauth") return "oauth";
-  return provider.model_catalog === "local" ? "local" : "api_key";
+  if (provider.auth_type === "cli" || provider.model_catalog === "local") return "local";
+  return "api_key";
 }
 
 

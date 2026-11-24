@@ -1304,4 +1304,107 @@ describe("Settings providers", () => {
     expect(JSON.parse(update.extraBody)).toEqual({ tools: [{ type: "web_search" }] });
   });
 
+  const claudeCliProvider = {
+    name: "claude_cli",
+    label: "Claude CLI",
+    configured: true,
+    auth_type: "cli" as const,
+    api_key_required: false,
+    cli_command: "/home/user/.local/bin/claude",
+  };
+  const claudeCliPreset = {
+    name: "claude-haiku",
+    label: "claude-haiku",
+    active: false,
+    is_default: false,
+    model: "claude_cli/haiku",
+    provider: "claude_cli",
+    resolved_provider: "claude_cli",
+    max_tokens: 8192,
+    context_window_tokens: 200000,
+    temperature: 0.1,
+    reasoning_effort: null,
+  };
+
+  it("shows the local Claude CLI setup state without key or base fields", async () => {
+    const user = userEvent.setup();
+    const payload = settingsPayload();
+    payload.providers = [claudeCliProvider];
+    payload.model_presets = [...payload.model_presets, claudeCliPreset];
+    renderProviderManager({ initialSection: "models", initialSettings: payload });
+    await user.click(screen.getByRole("button", { name: "Claude CLI" }));
+    const dialog = screen.getByRole("dialog", { name: "Claude CLI" });
+    expect(within(dialog).getByText("Ready")).toBeInTheDocument();
+    expect(within(dialog).getByText(/claude auth login/i)).toBeInTheDocument();
+    expect(within(dialog).getByText("/home/user/.local/bin/claude")).toBeInTheDocument();
+    expect(within(dialog).getByText("Model presets")).toBeInTheDocument();
+    expect(within(dialog).getByText("claude-haiku")).toBeInTheDocument();
+    expect(within(dialog).getByText("claude_cli/haiku")).toBeInTheDocument();
+    expect(within(dialog).queryByLabelText("API key", { selector: "input" })).not.toBeInTheDocument();
+    expect(within(dialog).queryByLabelText("API URL")).not.toBeInTheDocument();
+    expect(within(dialog).queryByRole("button", { name: "Add provider" })).not.toBeInTheDocument();
+    expect(within(dialog).queryByRole("button", { name: "Save provider" })).not.toBeInTheDocument();
+    await user.click(within(dialog).getByRole("button", { name: "Cancel" }));
+    expect(screen.getByRole("dialog", { name: "Manage providers" })).toBeVisible();
+    expect(requestMutationMock).not.toHaveBeenCalled();
+  });
+
+  it("guides a missing Claude CLI without requesting credentials", async () => {
+    const user = userEvent.setup();
+    const payload = settingsPayload();
+    payload.providers = [{ ...claudeCliProvider, configured: false, cli_command: "claude" }];
+    renderProviderManager({ initialSection: "models", initialSettings: payload });
+    await user.click(screen.getByRole("button", { name: "Add provider" }));
+    await user.click(await screen.findByRole("option", { name: "Claude CLI" }));
+    const dialog = screen.getByRole("dialog", { name: "Claude CLI" });
+    expect(within(dialog).getByText("Claude CLI not found")).toBeInTheDocument();
+    expect(within(dialog).getByText(/providers\.claude_cli\.command/)).toBeInTheDocument();
+    expect(within(dialog).queryByLabelText("API key", { selector: "input" })).not.toBeInTheDocument();
+    expect(within(dialog).queryByLabelText("API URL")).not.toBeInTheDocument();
+    await user.click(within(dialog).getByRole("button", { name: "Cancel" }));
+    await waitFor(() => expect(screen.getByRole("dialog", { name: "Manage providers" })).toBeVisible());
+    expect(requestMutationMock).not.toHaveBeenCalled();
+  });
+
+  it("creates a Claude CLI preset without an API key or base", async () => {
+    const user = userEvent.setup();
+    const payload = settingsPayload();
+    payload.providers = [claudeCliProvider];
+    requestMutationMock.mockResolvedValueOnce({
+      ...payload,
+      created_model_preset: "cli-preset",
+      model_presets: [
+        ...payload.model_presets,
+        { ...claudeCliPreset, active: true },
+      ],
+      model_call_order: [...payload.model_call_order, "cli-preset"],
+    });
+    renderSettingsView({ initialSection: "models", initialSettings: payload });
+    await user.click(screen.getByRole("button", { name: "New preset" }));
+    await user.type(screen.getByRole("textbox", { name: "Preset name" }), "CLI preset");
+    // The only configured provider is preselected, and CLI providers have
+    // neither key nor base fields.
+    const providerPicker = screen.getByRole("combobox", { name: "Claude CLI" });
+    expect(providerPicker).toHaveTextContent("Claude CLI");
+    expect(screen.queryByLabelText("API key", { selector: "input" })).not.toBeInTheDocument();
+    expect(screen.queryByLabelText("API URL")).not.toBeInTheDocument();
+    const model = screen.getByRole("combobox", { name: "Select model" });
+    await user.click(model);
+    fireEvent.change(model, { target: { value: "claude_cli/haiku" } });
+    await user.keyboard("{Enter}");
+    const saveButton = within(screen.getByTestId("model-preset-editor")).getByRole("button", { name: "Save", hidden: true });
+    expect(saveButton).toBeEnabled();
+    fireEvent.click(saveButton);
+    await waitFor(() => {
+      expect(requestMutationMock).toHaveBeenCalledWith(
+        "settings.model_configuration.create",
+        expect.objectContaining({
+          name: "CLI preset",
+          model: "claude_cli/haiku",
+          provider: "claude_cli",
+        }),
+        20_000,
+      );
+    });
+  });
 });

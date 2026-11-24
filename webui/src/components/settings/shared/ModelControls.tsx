@@ -234,7 +234,7 @@ export function ModelIdPicker({
     !hasStaticModels &&
     hasConcreteProvider &&
     providerConfigured &&
-    providerRow?.auth_type === "oauth" &&
+    (providerRow?.auth_type === "oauth" || providerRow?.auth_type === "cli") &&
     !providerHasManagedModels;
   const canFetchModels =
     !hasStaticModels &&
