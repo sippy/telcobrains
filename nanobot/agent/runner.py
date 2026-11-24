@@ -24,6 +24,7 @@ from nanobot.agent.context_governance import (
 from nanobot.agent.execution_policy import ExecutionControlError
 from nanobot.agent.hook import AgentHook, AgentHookContext, AgentRunHookContext
 from nanobot.agent.tools.context import tool_log_content_allowed
+from nanobot.agent.tools.dispatch import ToolDispatch
 from nanobot.agent.tools.execution import ToolCallResult, execute_tool_calls
 from nanobot.agent.tools.registry import ToolRegistry
 from nanobot.events import NO_EVENTS, EventSink, ModelRequestEvent, ResponseInputsEvent
@@ -514,6 +515,18 @@ class AgentRunner:
                 messages=messages,
                 session_key=spec.session_key,
             )
+            # The active turn's dispatch boundary: model-initiated calls in this
+            # iteration and hosted calls the provider turn makes through it (the
+            # Claude CLI tool bridge) share this registry, hook chain, and the
+            # run's per-turn policy accounting.
+            tool_dispatch = ToolDispatch(
+                tools=spec.tools,
+                hook=hook,
+                context=context,
+                concurrent=spec.concurrent_tools,
+                external_lookup_counts=external_lookup_counts,
+                workspace_violation_counts=workspace_violation_counts,
+            )
             await hook.before_iteration(context)
             request_message_count = len(messages)
             request_messages = await self.prepare_prompt(
@@ -527,6 +540,7 @@ class AgentRunner:
                 context,
                 request_state=request_state,
                 transcript=messages,
+                dispatch=tool_dispatch,
             )
             assert request_state.messages is not None
             messages_for_model = request_state.messages
@@ -656,6 +670,11 @@ class AgentRunner:
                     model_messages=messages_for_model,
                     compacted_tool_results=request_state.compacted_tool_results,
                     on_settled=settle_tool_results,
+                    dispatch=replace(
+                        tool_dispatch,
+                        model_messages=messages_for_model,
+                        compacted_tool_results=request_state.compacted_tool_results,
+                    ),
                 )
                 empty_content_retries = 0
                 length_recovery_parts.clear()
@@ -952,6 +971,7 @@ class AgentRunner:
         tools: list[dict[str, Any]] | None,
         request_state: ModelRequestState,
         transcript: list[dict[str, Any]] | None,
+        dispatch: ToolDispatch | None = None,
     ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
         messages, provider_context = await self.context_governor.prepare_request(
             request_state,
@@ -972,6 +992,9 @@ class AgentRunner:
                 provider_context or ProviderCallContext(),
                 response_preset=spec.runtime.model_preset or "",
                 model_options=spec.runtime.model_options,
+                workspace=str(spec.workspace) if spec.workspace is not None else None,
+                tool_registry=spec.tools,
+                tool_dispatch=dispatch,
             ),
         }
 
@@ -1044,14 +1067,21 @@ class AgentRunner:
         request_state: ModelRequestState,
         malformed_retry: bool = False,
         transcript: list[dict[str, Any]] | None,
+        dispatch: ToolDispatch | None = None,
     ) -> tuple[LLMResponse, LLMUsage]:
         _raise_if_cancelling()
+        # Tool-free providers (e.g. the explicit Claude CLI route) never receive
+        # tool definitions: the model cannot call tools the provider would refuse.
+        tool_definitions = (
+            spec.tools.get_definitions() if spec.runtime.provider.supports_tool_calls else None
+        )
         messages, kwargs = await self._prepare_model_request(
             spec,
             messages,
-            tools=spec.tools.get_definitions(),
+            tools=tool_definitions,
             request_state=request_state,
             transcript=transcript,
+            dispatch=dispatch,
         )
         _raise_if_cancelling()
         wants_streaming = hook.wants_streaming()
@@ -1226,6 +1256,7 @@ class AgentRunner:
                 request_state=request_state,
                 malformed_retry=True,
                 transcript=None,
+                dispatch=dispatch,
             )
             return retry_response, round_usage + retry_usage
         if (

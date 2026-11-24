@@ -145,6 +145,21 @@ class ProviderConversationStateController:
         supplemental = deepcopy(supplemental_messages or [])
         self._request_messages = deepcopy(request_messages)
         durable_pending = deepcopy([*self._state.pending_messages, *request_messages])
+        if durable_pending and len(supplemental) == 1:
+            # The tool-free governance path re-passes exactly one supplemental tail:
+            # the current turn's message, which the loop already staged into the
+            # resumable provider state. Drop that single duplicate so the durable
+            # delta stays exactly one new message; no other supplemental message is
+            # ever dropped, so other providers' shapes are untouched.
+            tail = supplemental[0]
+            last = durable_pending[-1]
+            if (
+                isinstance(tail, dict)
+                and isinstance(last, dict)
+                and tail.get("role") == last.get("role")
+                and tail.get("content") == last.get("content")
+            ):
+                supplemental = []
         request_state = self._state.with_pending_messages([*durable_pending, *supplemental])
         boundary = len(messages)
 

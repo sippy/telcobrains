@@ -125,6 +125,35 @@ def _make_provider_core(
             spec=custom_spec,
             provider_name=provider_name,
         )
+    elif backend == "claude_cli":
+        from nanobot.providers.claude_cli_bridge import (
+            DEFAULT_MAX_TOOL_RESULT_BYTES,
+            DEFAULT_TOOL_TIMEOUT_S,
+            ClaudeCodeToolBridge,
+        )
+        from nanobot.providers.claude_cli_provider import ClaudeCLIProvider
+
+        # Tools stay off unless explicitly opted in by exact name; the bridge is
+        # only constructed in that case and serves per-turn endpoints.
+        cli_tools = tuple(getattr(p, "tools", ()) or ())
+        provider = ClaudeCLIProvider(
+            default_model=model,
+            command=getattr(p, "command", "claude") or "claude",
+            timeout_s=getattr(p, "timeout_s", 120.0),
+            max_output_bytes=getattr(p, "max_output_bytes", 8 * 1024 * 1024),
+            tools=cli_tools,
+            tool_bridge=(
+                ClaudeCodeToolBridge(
+                    tool_timeout_s=getattr(p, "tool_timeout_s", DEFAULT_TOOL_TIMEOUT_S),
+                    max_result_bytes=getattr(
+                        p, "max_tool_result_bytes", DEFAULT_MAX_TOOL_RESULT_BYTES
+                    ),
+                )
+                if cli_tools
+                else None
+            ),
+            provider_name=provider_name,
+        )
     elif backend == "bedrock":
         from nanobot.providers.bedrock_provider import BedrockProvider
 
@@ -155,6 +184,10 @@ def _make_provider_core(
 
     provider.generation = preset.to_generation_settings()
     provider.supports_images = preset.supports_images
+    if backend == "claude_cli":
+        # The CLI route performs tool-free text completions only; never advertise
+        # image support for it regardless of the preset's default.
+        provider.supports_images = False
     return provider
 
 
@@ -268,6 +301,8 @@ def _preset_provider_signature(
         preset.api.model_dump_json() if preset.api is not None else None,
         config.network.resolve_proxy(provider_config.use_proxy) if provider_config else None,
         provider_config.thinking_style if provider_config else None,
+        # Claude CLI route: explicit tool opt-in changes the provider's behavior.
+        tuple(getattr(provider_config, "tools", ()) or ()) if provider_config else None,
     )
 
 

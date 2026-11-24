@@ -1247,6 +1247,40 @@ async def test_runner_passes_generation_settings_to_provider():
     assert captured["reasoning_effort"] == "high"
 
 @pytest.mark.asyncio
+async def test_runner_exposes_the_turn_tool_registry_in_provider_context():
+    from nanobot.agent.hook import AgentHook
+    from nanobot.agent.runner import AgentRunner
+
+    captured: dict = {}
+
+    async def chat_stream_with_retry(**kwargs):
+        captured.update(kwargs)
+        return LLMResponse(content="done", tool_calls=[], usage=None)
+
+    provider = MagicMock(spec=LLMProvider)
+    provider.chat_stream_with_retry = chat_stream_with_retry
+    tools = MagicMock()
+    tools.get_definitions.return_value = []
+
+    runner = AgentRunner()
+    await runner.run(make_run_spec(provider,
+        initial_messages=[{"role": "user", "content": "hi"}],
+        tools=tools,
+        model="test-model",
+        max_iterations=1,
+        max_tool_result_chars=_MAX_TOOL_RESULT_CHARS,
+    ))
+
+    # Providers that execute tools through the turn's dispatch boundary
+    # (the Claude CLI bridge) receive the active turn's own registry and the
+    # turn's shared dispatch boundary (registry, hook chain, policy accounting).
+    assert captured["provider_context"].tool_registry is tools
+    dispatch = captured["provider_context"].tool_dispatch
+    assert dispatch is not None
+    assert dispatch.tools is tools
+    assert isinstance(dispatch.hook, AgentHook)
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("automated", [False, True])
 async def test_runner_continuation_preserves_request_ownership(automated):
     from nanobot.agent.runner import AgentRunner

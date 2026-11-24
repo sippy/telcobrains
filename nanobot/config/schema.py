@@ -28,6 +28,7 @@ from nanobot.agent.tools.web_config import (
     WebSearchConfig as WebSearchConfig,
 )
 from nanobot.agent.tools.web_config import WebToolsConfig
+from nanobot.config.claude_cli_tools import CLAUDE_CLI_TOOL_ALLOWLIST
 from nanobot.config.home import get_default_workspace
 from nanobot.config.network import NetworkConfig, migrate_legacy_proxy_config
 from nanobot.config.timezone import detect_system_timezone
@@ -346,6 +347,43 @@ class BedrockProviderConfig(ProviderConfig):
     profile: str | None = None  # Optional AWS shared config profile
 
 
+class ClaudeCLIProviderConfig(ProviderConfig):
+    """Local Claude Code CLI route configuration.
+
+    The installed ``claude`` CLI owns its existing local login; no API key is used,
+    read, copied, or stored by this route. ``api_key``/``api_base`` are accepted for
+    schema compatibility but ignored.
+
+    Tools are disabled by default. ``tools`` is an exact opt-in allowlist: zero
+    tools, or the workspace-only ``read_file``. An opted-in turn serves that
+    tool through a per-turn, localhost-authenticated MCP endpoint, dispatching
+    every call through the turn's own tool registry, so the tool's own
+    workspace policies apply. Any other name is a configuration error; a
+    same-named custom tool is refused at turn start. See
+    ``docs/claude-cli.md``.
+    """
+
+    command: str = "claude"  # "claude" or a full path if the service PATH omits it
+    timeout_s: float = Field(default=120.0, gt=0)  # Wall-clock bound for one completion
+    max_output_bytes: int = Field(default=8 * 1024 * 1024, ge=1024)  # Stream size bound
+    tools: list[str] = Field(default_factory=list)  # Exact allowlist; empty = tool-free
+    tool_timeout_s: float = Field(default=60.0, gt=0)  # Wall-clock bound for one tool call
+    max_tool_result_bytes: int = Field(default=64 * 1024, ge=256)  # Tool result size bound
+
+    @field_validator("tools")
+    @classmethod
+    def _validate_tool_names(cls, value: list[str]) -> list[str]:
+        for name in value:
+            if not name.strip():
+                raise ValueError("tools entries must be non-empty tool names")
+            if name not in CLAUDE_CLI_TOOL_ALLOWLIST:
+                raise ValueError(
+                    f"tools: '{name}' is not allowed; the only opt-in tool is "
+                    "'read_file' (workspace-only)"
+                )
+        return value
+
+
 class ProvidersConfig(Base):
     """Configuration for LLM providers.
 
@@ -358,6 +396,7 @@ class ProvidersConfig(Base):
     custom: ProviderConfig = Field(default_factory=ProviderConfig)  # Any OpenAI-compatible endpoint
     azure_openai: ProviderConfig = Field(default_factory=ProviderConfig)  # Azure OpenAI (model = deployment name)
     bedrock: BedrockProviderConfig = Field(default_factory=BedrockProviderConfig)
+    claude_cli: ClaudeCLIProviderConfig = Field(default_factory=ClaudeCLIProviderConfig)
     anthropic: ProviderConfig = Field(default_factory=ProviderConfig)
     openai: ProviderConfig = Field(default_factory=ProviderConfig)
     openrouter: ProviderConfig = Field(default_factory=ProviderConfig)

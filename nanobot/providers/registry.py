@@ -508,6 +508,20 @@ PROVIDERS: tuple[ProviderSpec, ...] = (
         backend="anthropic",
         supports_prompt_caching=True,
     ),
+    # Claude Code CLI: an explicit, opt-in local route. It is selected only by a
+    # preset that names ``provider: "claude_cli"`` (or a ``claude_cli/<model>`` ref)
+    # and runs the installed ``claude`` CLI, which owns its own local login. It has
+    # no HTTP request APIs and needs no API key, and it never falls back to the
+    # Anthropic HTTP provider. See ``docs/claude-cli.md``.
+    ProviderSpec(
+        name="claude_cli",
+        keywords=(),
+        env_key="",
+        request_apis=(),
+        display_name="Claude CLI",
+        backend="claude_cli",
+        is_direct=True,
+    ),
     # OpenAI: SDK default base URL (no override needed)
     ProviderSpec(
         name="openai",

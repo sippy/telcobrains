@@ -516,6 +516,12 @@ class WorkspaceFiles:
     def display_workspace(self) -> Path | None:
         return current_tool_workspace(self._workspace).project_path
 
+    @property
+    def workspace(self) -> Path | None:
+        """The workspace the tool was constructed against (not the effective
+        call scope, which a bound turn scope may override)."""
+        return self._workspace
+
     def _allowed_root(self, request_root: Path | None) -> Path | None:
         if self._allowed_dir is None or self._workspace is None:
             return request_root

@@ -40,6 +40,8 @@ from nanobot.utils.cancellation import shield_and_drain
 from nanobot.utils.helpers import sanitize_surrogates_deep
 
 if TYPE_CHECKING:
+    from nanobot.agent.tools.dispatch import ToolDispatch
+    from nanobot.agent.tools.registry import ToolRegistry
     from nanobot.llm_usage.models import LLMCallRecord
 
 STREAM_IDLE_TIMEOUT_ENV = "NANOBOT_STREAM_IDLE_TIMEOUT_S"
@@ -275,15 +277,30 @@ class ProviderCallContext:
     hooks, while every other provider inherits the context-free delegation.
     ``session_id`` gives providers a stable conversation-scoped routing key
     without exposing that identity in the public message transcript.
+    ``workspace`` names the owning conversation's workspace directory when the
+    turn runs with a scoped workspace; providers may bind provider-owned state
+    to it so a saved session cannot be resumed from a different scope.
+    ``tool_registry`` carries the active turn's own tool registry (supplied by
+    the agent runner) for providers that execute tools through the turn's
+    dispatch boundary (the Claude CLI tool bridge); it is None for calls made
+    outside an agent turn, which cannot authorize tool execution.
+    ``tool_dispatch`` carries the active turn's tool dispatch boundary (the
+    registry, the turn's hook chain, and the turn's policy accounting) supplied
+    by the agent runner, so a provider-hosted client (the Claude CLI tool
+    bridge) executes every call through exactly the same execution, policy,
+    and observability boundary as the turn's own model-initiated tool calls;
+    it is None for calls made outside an agent turn.
     """
 
     conversation_state: ProviderConversationState | None = field(default=None, repr=False)
     context_window_tokens: int | None = None
     session_id: str | None = field(default=None, repr=False)
+    workspace: str | None = field(default=None, repr=False)
     events: EventSink = field(default=NO_EVENTS, repr=False, compare=False)
     # None opts out (auxiliary calls); an empty name denotes an unnamed preset.
     response_preset: str | None = None
     response_is_fallback: bool = False
+    tool_registry: ToolRegistry | None = field(default=None, repr=False, compare=False)
     model_options: ModelOptions = ModelOptions()
     # A pre-request compactor must fit this budget before sending the pending input.
     compaction_input_budget: int | None = None
@@ -292,6 +309,7 @@ class ProviderCallContext:
     on_native_compaction: Callable[[ProviderConversationState], Awaitable[None]] | None = field(
         default=None, repr=False, compare=False,
     )
+    tool_dispatch: ToolDispatch | None = field(default=None, repr=False, compare=False)
 
     @property
     def accepted_compaction(self) -> NativeCompaction | None:
@@ -381,6 +399,10 @@ _SYNTHETIC_USER_CONTENT = "(conversation continued)"
 
 class LLMProvider(ABC):
     """Base class for LLM providers."""
+
+    # Tool-free providers (e.g. the explicit Claude CLI route) set this to False so
+    # the runner never sends them tool definitions they would refuse.
+    supports_tool_calls: bool = True
 
     _CHAT_RETRY_DELAYS = (1, 2, 4)
     _PERSISTENT_MAX_DELAY = 60
