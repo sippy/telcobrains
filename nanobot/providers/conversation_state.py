@@ -14,6 +14,10 @@ from nanobot.utils.helpers import estimate_prompt_tokens_chain
 
 _PROVIDER_STATE_OUTPUT_META = "provider_state_output"
 _PROVIDER_STATE_BOUNDARY_META = "provider_state_boundary"
+# The runner's local projection of a failed model response. It is a display
+# artifact, never provider output, so providers resuming provider-owned state
+# can recognize it in a pending delta and keep it out of native history.
+MODEL_ERROR_PLACEHOLDER = "[Assistant reply unavailable due to model error.]"
 
 
 def allows_conversation_message_merge(message: dict[str, Any]) -> bool:
@@ -215,6 +219,16 @@ class ProviderConversationStateController:
                 and LLMProvider.is_transient_response(response)
             )
         ):
+            candidate = response.provider_state
+            if (
+                candidate is not None
+                and response.preserve_provider_state_on_error is True
+                and self._provider.can_resume_conversation_state(candidate, self._model)
+            ):
+                # A provider proving the error predates any generation may hand
+                # over the state to keep (e.g. a freshly created native session
+                # that refused the first turn).
+                self._state = candidate
             if self._state is not None and self._request_messages:
                 self._state = self._state.with_pending_messages([
                     *self._state.pending_messages,

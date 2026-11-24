@@ -7,9 +7,10 @@ import pytest
 
 from agent.runner_helpers import make_run_spec
 from nanobot.agent.progress_hook import AgentProgressHook
-from nanobot.agent.runner import _PERSISTED_MODEL_ERROR_PLACEHOLDER, AgentRunner
+from nanobot.agent.runner import AgentRunner
 from nanobot.config.schema import ModelPresetConfig
 from nanobot.providers.base import LLMProvider, LLMResponse, ToolCallRequest
+from nanobot.providers.conversation_state import MODEL_ERROR_PLACEHOLDER
 from nanobot.providers.fallback_provider import FallbackProvider
 from nanobot.providers.model_api import ModelAPICapabilities
 from nanobot.providers.openai_compat_provider import OpenAICompatProvider
@@ -119,7 +120,7 @@ async def test_reasoning_only_failure_does_not_claim_a_preserved_reply():
         hook=AgentProgressHook(streaming=True),
     ))
 
-    assert result.messages[-1]["content"] == _PERSISTED_MODEL_ERROR_PLACEHOLDER
+    assert result.messages[-1]["content"] == MODEL_ERROR_PLACEHOLDER
     assert result.messages[-1].get("_interrupted") is not True
     assert result.stop_reason == "error"
 
@@ -140,7 +141,7 @@ async def test_nonstreaming_provider_error_is_not_observed_as_assistant_body():
     assert result.failure_error_kind == "unknown"
     assert result.error == result.final_content
     assert "Open Settings → Models" in result.final_content
-    assert result.messages[-1]["content"] == _PERSISTED_MODEL_ERROR_PLACEHOLDER
+    assert result.messages[-1]["content"] == MODEL_ERROR_PLACEHOLDER
     assert result.messages[-1].get("_interrupted") is not True
     show.assert_not_awaited()
 

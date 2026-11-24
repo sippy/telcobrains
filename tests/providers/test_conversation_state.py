@@ -12,6 +12,7 @@ from nanobot.providers.base import (
     ToolCallRequest,
 )
 from nanobot.providers.conversation_state import (
+    MODEL_ERROR_PLACEHOLDER,
     ProviderConversationStateController,
     allows_conversation_message_merge,
 )
@@ -276,6 +277,73 @@ def test_non_retryable_response_discards_saved_state() -> None:
     )
 
     assert controller.finish(messages) is None
+
+
+@pytest.mark.asyncio
+async def test_pre_generation_refusal_can_hand_over_fresh_provider_state() -> None:
+    """A provably pre-generation error may preserve state it just created.
+
+    This is how a stateful provider keeps a conversation alive when its very
+    first turn is refused (e.g. a native session that refused the input before
+    generating anything). The handover requires the explicit preserve flag.
+    """
+    provider = _provider()
+    messages = [{"role": "user", "content": "start"}]
+    controller = ProviderConversationStateController(
+        provider=provider,
+        model="gpt-5.6",
+        messages=messages,
+        state=None,
+    )
+
+    controller.prepare_request(messages, context_window_tokens=200_000)
+    fresh = _state("refused-fresh")
+    controller.observe_response(
+        LLMResponse(
+            content="usage limit reached",
+            finish_reason="error",
+            error_kind="usage_limit",
+            error_should_retry=False,
+            provider_state=fresh,
+            preserve_provider_state_on_error=True,
+        ),
+        messages,
+    )
+    # The runner closes the failed turn with its local error placeholder.
+    messages.append({"role": "assistant", "content": MODEL_ERROR_PLACEHOLDER})
+
+    state = controller.finish(messages)
+    assert state is not None
+    assert state.payload == fresh.payload
+    assert state.pending_messages == [{"role": "assistant", "content": MODEL_ERROR_PLACEHOLDER}]
+
+
+@pytest.mark.asyncio
+async def test_transient_error_does_not_adopt_provider_state() -> None:
+    """Without the explicit preserve flag a candidate state is never adopted."""
+    provider = _provider()
+    messages = [{"role": "user", "content": "continue"}]
+    controller = ProviderConversationStateController(
+        provider=provider,
+        model="gpt-5.6",
+        messages=messages,
+        state=_state("saved", pending=[{"role": "tool", "content": "prior"}]),
+    )
+
+    controller.prepare_request(messages, context_window_tokens=200_000)
+    controller.observe_response(
+        LLMResponse(
+            content="temporary failure",
+            finish_reason="error",
+            error_kind="timeout",
+            provider_state=_state("unadopted"),
+        ),
+        messages,
+    )
+
+    state = controller.finish(messages)
+    assert state is not None
+    assert state.payload == _state("saved").payload
 
 
 @pytest.mark.parametrize(

@@ -115,10 +115,8 @@ async def test_tool_execution_propagates_control_flow_exceptions(control_error: 
 async def test_llm_error_not_appended_to_session_messages():
     """When LLM returns finish_reason='error', the error content must NOT be
     appended to the messages list (prevents polluting session history)."""
-    from nanobot.agent.runner import (
-        _PERSISTED_MODEL_ERROR_PLACEHOLDER,
-        AgentRunner,
-    )
+    from nanobot.agent.runner import AgentRunner
+    from nanobot.providers.conversation_state import MODEL_ERROR_PLACEHOLDER
 
     provider = MagicMock(spec=LLMProvider)
     provider.chat_stream_with_retry = AsyncMock(return_value=LLMResponse(
@@ -141,7 +139,7 @@ async def test_llm_error_not_appended_to_session_messages():
     assistant_msgs = [m for m in result.messages if m.get("role") == "assistant"]
     assert all("429" not in (m.get("content") or "") for m in assistant_msgs), \
         "Error content should not appear in session messages"
-    assert assistant_msgs[-1]["content"] == _PERSISTED_MODEL_ERROR_PLACEHOLDER
+    assert assistant_msgs[-1]["content"] == MODEL_ERROR_PLACEHOLDER
 
 
 @pytest.mark.asyncio

@@ -64,6 +64,7 @@ from nanobot.providers.claude_cli_bridge import (
     ToolBridge,
 )
 from nanobot.providers.claude_cli_tool_dispatch import ToolDispatch
+from nanobot.providers.conversation_state import MODEL_ERROR_PLACEHOLDER
 from nanobot.runtime_context import RUNTIME_CONTEXT_MESSAGE_META, detach_runtime_context
 from nanobot.utils.cancellation import shield_and_drain
 
@@ -109,6 +110,15 @@ SESSION_INTERRUPTED_MESSAGE = (
     "The previous turn was interrupted, so this Claude CLI conversation can no longer be "
     "resumed. Start a new chat to continue."
 )
+# A newer input was sent on top of a pre-generation refusal's input, but the
+# native session file cannot prove the refusal recorded that input: it cannot be
+# dropped (the CLI may already hold it) or replayed (that would duplicate its
+# native history), so the session cannot be resumed at all.
+REJECTED_INPUT_UNVERIFIED_MESSAGE = (
+    "The previous turn was refused before a response, and its input could not be verified "
+    "against the Claude CLI session, so this conversation cannot be safely resumed. Start "
+    "a new chat to continue."
+)
 USAGE_LIMIT_MESSAGE = (
     "Claude Code has reached the usage limit for your plan. Try again after the limit resets."
 )
@@ -120,6 +130,22 @@ RATE_LIMIT_MESSAGE = "Claude Code is temporarily rate-limiting requests. Try aga
 # Stable structured code for the subscription/plan usage limit in the CLI's
 # terminal result record (``api_error``).
 _USAGE_LIMIT_API_ERROR = "usage_limit_reached"
+
+# Provider error kinds that are provably refused *before* generation: the CLI's
+# terminal result is an error, it carried no assistant output, and the known
+# structured taxonomy names the upstream refusal. No tool work or partial answer
+# can have happened for these, but the CLI may still have recorded the user
+# input in its native session history.
+_PRE_GENERATION_REJECTION_KINDS = frozenset({"usage_limit", "rate_limit"})
+
+# The native session file layout the CLI is known to write: <home>/.claude/
+# projects/<cwd with every non-alphanumeric replaced by "-">/<uuid>.jsonl, one
+# JSON record per line.
+_NATIVE_SESSION_UUID_RE = re.compile(
+    r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+)
+_MAX_TAIL_RECORDS = 16
+_TAIL_SCAN_BYTES = 1 * 1024 * 1024
 # The CLI reports the usage-limit reset as e.g. "resets 1pm (America/Vancouver)".
 # Accept only that exact shape: a 12-hour clock (optional :mm) and an IANA zone
 # name; both parts are validated before use.
@@ -513,6 +539,104 @@ def _classify_structured_api_error(
     return None
 
 
+def _user_record_text(content: Any) -> str | None:
+    """Return the text of a native-session user record, or None when its shape is unknown.
+
+    Only the exact shapes the CLI is known to write are trusted: a plain
+    string, or a content list of exactly one text block. Anything else (media,
+    tool calls, unknown blocks) makes the record unverifiable.
+    """
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        if len(content) != 1 or not isinstance(content[0], dict):
+            return None
+        block = content[0]
+        if block.get("type") != "text" or not isinstance(block.get("text"), str):
+            return None
+        return block["text"]
+    return None
+
+
+def _native_session_tail_records(
+    session_id: str,
+    expected_count: int,
+    cwd: str,
+    home: str,
+) -> list[dict[str, Any]] | None:
+    """Return the last *expected_count* records of a native session file, or None.
+
+    Read-only evidence about the CLI's own history. Records are returned only
+    when every tail line is a well-formed JSON object carrying a string record
+    type; a missing or unreadable file, a truncated line, or any other shape
+    yields None so the caller stays fail-closed.
+    """
+    if not _NATIVE_SESSION_UUID_RE.fullmatch(session_id or ""):
+        return None
+    if expected_count <= 0 or expected_count > _MAX_TAIL_RECORDS:
+        return None
+    if not cwd or not home:
+        return None
+    path = Path(home) / ".claude" / "projects" / re.sub(r"[^A-Za-z0-9]", "-", cwd) / f"{session_id}.jsonl"
+    try:
+        if not path.is_file():
+            return None
+        size = path.stat().st_size
+        if size == 0:
+            return None
+        with path.open("rb") as handle:
+            if size <= _TAIL_SCAN_BYTES:
+                data = handle.read()
+            else:
+                handle.seek(size - _TAIL_SCAN_BYTES)
+                data = handle.read()
+    except OSError:
+        return None
+    if len(data) == _TAIL_SCAN_BYTES and not data.startswith(b"{"):
+        # The scan window starts mid-line; resync to the first complete line.
+        newline = data.find(b"\n")
+        if newline < 0:
+            return None
+        data = data[newline + 1 :]
+    lines = [line for line in data.split(b"\n") if line.strip()]
+    if len(lines) < expected_count:
+        return None
+    records: list[dict[str, Any]] = []
+    for line in lines[-expected_count:]:
+        if len(line) > MAX_LINE_BYTES:
+            return None
+        try:
+            record = json.loads(line.decode("utf-8"))
+        except (UnicodeDecodeError, ValueError):
+            return None
+        if not isinstance(record, dict) or not isinstance(record.get("type"), str):
+            return None
+        records.append(record)
+    return records
+
+
+def _native_tail_matches(
+    records: list[dict[str, Any]],
+    expected_texts: list[str],
+    session_id: str,
+) -> bool:
+    """Whether the native tail is exactly *expected_texts*, as main-line user records."""
+    for record, text in zip(records, expected_texts):
+        if record.get("type") != "user":
+            return False
+        if record.get("isSidechain") is True or record.get("agentId") not in (None, ""):
+            return False
+        session_record_id = record.get("sessionId")
+        if session_record_id is not None and session_record_id != session_id:
+            return False
+        message = record.get("message")
+        if not isinstance(message, dict) or message.get("role") != "user":
+            return False
+        if _user_record_text(message.get("content")) != text:
+            return False
+    return True
+
+
 def _classify_cli_failure(diagnostics: list[str], returncode: int | None) -> tuple[str, str]:
     """Map a failed CLI run to a useful, bounded status without private payloads."""
     blob = " ".join(diagnostics).lower()
@@ -732,37 +856,128 @@ class ClaudeCLIProvider(LLMProvider):
             },
         )
 
-    def _resume_prompt(self, pending_messages: list[dict[str, Any]]) -> str:
+    def _resume_prompt(
+        self,
+        pending_messages: list[dict[str, Any]],
+        transcript: list[dict[str, Any]],
+        *,
+        session_id: str,
+        cwd: str,
+        home: str,
+    ) -> str:
         """Return the exact new user input for a resume, or refuse.
 
         A resume sends only the single new user message over stdin. The prior
         conversation lives in the CLI's own session; a transcript replay — or a
         merged/queued batch of messages — is refused rather than folded in.
+
+        The one exception is a leftover of a turn that ended in a model error
+        before any response: the preserved pending delta then carries only the
+        runner's local error placeholder(s), and the refused input sits in the
+        transcript right before them. The CLI may already have recorded that
+        input in its native session history, so resending it would duplicate
+        the CLI's own records. The new input is sent alone *only* when the
+        native session file proves the last recorded record is exactly that
+        input; without that proof the turn is refused fail-closed with
+        actionable guidance, never replayed.
         """
         if not isinstance(pending_messages, list) or not pending_messages:
             raise _RequestRefusedError(
                 "The Claude CLI resume route needs exactly one new user message; "
                 "other shapes are refused."
             )
-        if len(pending_messages) > 1:
+        if len(pending_messages) == 1:
+            prompt = self._validated_prompt_text(pending_messages[0])
+            if prompt is None:
+                raise _RequestRefusedError(
+                    "The Claude CLI resume route needs a non-empty text message; images and "
+                    "structured content are not supported."
+                )
+            return prompt
+        old, newest = pending_messages[:-1], pending_messages[-1]
+        if not all(self._is_model_error_placeholder(message) for message in old):
             # Several pending messages can only come from a leftover of an
             # interrupted (e.g. cancelled) turn: the current message was staged
             # on top of the previous turn's. The native session can't be resumed
             # safely (that would replay or drop the leftover), so give the user an
             # actionable next step instead of a technical shape error.
             raise _RequestRefusedError(SESSION_INTERRUPTED_MESSAGE)
-        message = pending_messages[0]
+        prompt = self._validated_prompt_text(newest)
+        if prompt is None:
+            raise _RequestRefusedError(SESSION_INTERRUPTED_MESSAGE)
+        # The refused input of the last failed turn is the user message that
+        # the transcript places immediately before the placeholder run. Any
+        # other transcript shape is a leftover we cannot reason about safely.
+        refused_input = self._refused_input_before_placeholders(
+            transcript, len(old), prompt
+        )
+        if refused_input is None:
+            raise _RequestRefusedError(SESSION_INTERRUPTED_MESSAGE)
+        records = _native_session_tail_records(session_id, 1, cwd, home)
+        if records is None or not _native_tail_matches(records, [refused_input], session_id):
+            # No reliable evidence that the refused input is the native session's
+            # tail: resending it could duplicate native history, and sending the
+            # new input alone could drop it. Fail closed with actionable guidance.
+            raise _RequestRefusedError(REJECTED_INPUT_UNVERIFIED_MESSAGE)
+        return prompt
+
+    @staticmethod
+    def _validated_prompt_text(message: Any) -> str | None:
+        """Return the user-visible prompt text of *message*, or None when unusable."""
         if not isinstance(message, dict) or message.get("role") != "user":
-            raise _RequestRefusedError(
-                "The Claude CLI resume route expects one new user message; other roles are refused."
-            )
+            return None
         prompt = _prompt_text(message)
         if prompt is None or not prompt.strip():
-            raise _RequestRefusedError(
-                "The Claude CLI resume route needs a non-empty text message; images and "
-                "structured content are not supported."
-            )
+            return None
         return prompt
+
+    @staticmethod
+    def _is_model_error_placeholder(message: Any) -> bool:
+        """Whether *message* is the runner's local projection of a failed turn.
+
+        It is never provider output and is never part of the CLI's native
+        session, so it can be skipped when verifying the native tail.
+        """
+        return (
+            isinstance(message, dict)
+            and message.get("role") == "assistant"
+            and message.get("content") == MODEL_ERROR_PLACEHOLDER
+            and not message.get("tool_calls")
+        )
+
+    @classmethod
+    def _refused_input_before_placeholders(
+        cls,
+        transcript: Any,
+        placeholder_count: int,
+        new_prompt: str,
+    ) -> str | None:
+        """Return the refused input for a ``[input, placeholder..., new]`` transcript tail.
+
+        Returns None for any shape that does not match exactly: the transcript
+        must end with the new user message, preceded by exactly
+        *placeholder_count* error placeholders, preceded by the single user
+        message whose turn failed.
+        """
+        if not isinstance(transcript, list):
+            return None
+        if len(transcript) < placeholder_count + 2:
+            return None
+        refused, placeholders, new = (
+            transcript[-(placeholder_count + 2)],
+            transcript[-(placeholder_count + 1):-1],
+            transcript[-1],
+        )
+        if not (
+            all(cls._is_model_error_placeholder(message) for message in placeholders)
+            and isinstance(new, dict)
+            and new.get("role") == "user"
+            and _prompt_text(new) == new_prompt
+            and isinstance(refused, dict)
+            and refused.get("role") == "user"
+        ):
+            return None
+        return cls._validated_prompt_text(refused)
 
     async def _verify_identity(self, executable: str, env: dict[str, str]) -> str:
         """Verify the CLI's login via its own ``auth status`` attestation.
@@ -1044,7 +1259,17 @@ class ClaudeCLIProvider(LLMProvider):
             ):
                 return self._error("session_binding", SESSION_BINDING_MESSAGE)
             try:
-                prompt = self._resume_prompt(state.pending_messages)
+                # The native-session evidence uses the exact coordinates of this
+                # run: the cwd and HOME the CLI subprocess will see (the cleaned
+                # environment never strips HOME, and the CLI derives its project
+                # directory from its canonical working directory).
+                prompt = self._resume_prompt(
+                    state.pending_messages,
+                    messages,
+                    session_id=state.payload["session_id"],
+                    cwd=os.path.realpath(self.cwd),
+                    home=os.environ.get("HOME") or os.path.expanduser("~"),
+                )
             except _RequestRefusedError as exc:
                 return self._error("bad_request", str(exc))
             resume_id = state.payload["session_id"]
@@ -1137,6 +1362,27 @@ class ClaudeCLIProvider(LLMProvider):
                 )
             else:
                 logger.warning("Claude CLI returned no session id for {}", self.command)
+        elif (
+            response.finish_reason == "error"
+            and response.error_kind in _PRE_GENERATION_REJECTION_KINDS
+            and not resume_requested
+            and persist
+            and identity is not None
+            and context is not None
+            and parsed.session_id
+        ):
+            # A fresh turn refused before generation: the CLI still created its
+            # native session, confirmed the id, and may have recorded the input.
+            # Record the binding (the response carries
+            # preserve_provider_state_on_error) so the conversation can resume
+            # from that session once the condition clears.
+            response.provider_state = self._build_session_state(
+                cli=cli,
+                model=effective_model,
+                session_id=parsed.session_id,
+                context=context,
+                identity=identity,
+            )
         return response
 
     # ------------------------------------------------------------------ #
@@ -1396,13 +1642,24 @@ class ClaudeCLIProvider(LLMProvider):
             structured = _classify_structured_api_error(parsed.result_record)
             if structured is not None:
                 kind, message, extra = structured
-                return self._error(
+                response = self._error(
                     kind,
                     message,
                     error_status_code=extra.get("status_code"),
                     reset_time=extra.get("reset_time"),
                     reset_timezone=extra.get("reset_timezone"),
                 )
+                if kind in _PRE_GENERATION_REJECTION_KINDS:
+                    # The upstream refused before generation: no tool ran and no
+                    # partial answer was produced, so the recorded native session
+                    # can still be resumed once the condition clears. The refused
+                    # input is never blindly replayed on that resume: the runner
+                    # keeps only its local error placeholder in the pending delta,
+                    # and the CLI's own native session file must prove that input
+                    # is already its tail before the new message is sent (see
+                    # _resume_prompt). Without that proof the resume fails closed.
+                    response.preserve_provider_state_on_error = True
+                return response
             return self._error(
                 "cli_error",
                 "Claude CLI finished with an error before returning a completion.",

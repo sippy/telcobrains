@@ -42,7 +42,10 @@ from nanobot.providers.base import (
     ProviderConversationState,
 )
 from nanobot.providers.compaction import ProviderStateCommitError
-from nanobot.providers.conversation_state import ProviderConversationStateController
+from nanobot.providers.conversation_state import (
+    MODEL_ERROR_PLACEHOLDER,
+    ProviderConversationStateController,
+)
 from nanobot.session.history_visibility import HIDDEN_HISTORY_META, is_hidden_history_message
 from nanobot.session.summary import CompactorInputBudget, SessionSummaryCheckpoint
 from nanobot.utils.cancellation import shield_and_drain
@@ -96,7 +99,6 @@ _ARREARAGE_ERROR_MESSAGE = (
     "The AI provider rejected the request because the API key is out of quota or the "
     "account is in arrears. Please top up / check the billing status of your API key and try again."
 )
-_PERSISTED_MODEL_ERROR_PLACEHOLDER = "[Assistant reply unavailable due to model error.]"
 _MAX_EMPTY_RETRIES = 2
 _MAX_LENGTH_RECOVERIES = 3
 _PromptArgs = ParamSpec("_PromptArgs")
@@ -1616,4 +1618,4 @@ class AgentRunner:
     def _append_model_error_placeholder(messages: list[dict[str, Any]]) -> None:
         if messages and messages[-1].get("role") == "assistant" and not messages[-1].get("tool_calls"):
             return
-        messages.append(build_assistant_message(_PERSISTED_MODEL_ERROR_PLACEHOLDER))
+        messages.append(build_assistant_message(MODEL_ERROR_PLACEHOLDER))

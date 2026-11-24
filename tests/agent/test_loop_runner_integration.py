@@ -577,9 +577,9 @@ async def test_ssrf_soft_block_can_finalize_after_streamed_tool_call(tmp_path):
 @pytest.mark.asyncio
 async def test_next_turn_after_llm_error_keeps_turn_boundary(tmp_path):
     from nanobot.agent.loop import AgentLoop
-    from nanobot.agent.runner import _PERSISTED_MODEL_ERROR_PLACEHOLDER
     from nanobot.bus.events import InboundMessage
     from nanobot.bus.queue import MessageBus
+    from nanobot.providers.conversation_state import MODEL_ERROR_PLACEHOLDER
 
     provider = MagicMock()
     provider.get_default_model.return_value = "test-model"
@@ -603,7 +603,7 @@ async def test_next_turn_after_llm_error_keeps_turn_boundary(tmp_path):
         for message in map(public_history_message, session.messages)
     ] == [
         {"role": "user", "content": "first question"},
-        {"role": "assistant", "content": _PERSISTED_MODEL_ERROR_PLACEHOLDER},
+        {"role": "assistant", "content": MODEL_ERROR_PLACEHOLDER},
     ]
 
     second = await loop._process_message(
@@ -617,7 +617,7 @@ async def test_next_turn_after_llm_error_keeps_turn_boundary(tmp_path):
     assert non_system[0]["role"] == "user"
     assert "first question" in non_system[0]["content"]
     assert non_system[1]["role"] == "assistant"
-    assert _PERSISTED_MODEL_ERROR_PLACEHOLDER in non_system[1]["content"]
+    assert MODEL_ERROR_PLACEHOLDER in non_system[1]["content"]
     assert non_system[2]["role"] == "user"
     assert "second question" in non_system[2]["content"]
 
